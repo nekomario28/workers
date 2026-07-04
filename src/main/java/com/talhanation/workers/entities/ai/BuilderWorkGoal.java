@@ -50,6 +50,12 @@ public class BuilderWorkGoal extends Goal {
     public Stack<BlockPos> stackToPlace;
     public int minBuildHeight;
 
+    // Feature: look-ahead prefetching. Instead of fetching a single material and
+    // walking back to storage for the next one, the builder pulls up to this many
+    // DISTINCT materials in one storage trip, sized to the whole structure's needs.
+    private static final int PREFETCH_MATERIAL_BUDGET = 4;
+    private static final int PREFETCH_STACK_LIMIT = 64;
+
     public BuilderWorkGoal(BuilderEntity builderEntity) {
         this.builderEntity = builderEntity;
         setFlags(EnumSet.of(Flag.LOOK, Flag.MOVE));
@@ -210,7 +216,7 @@ public class BuilderWorkGoal extends Goal {
                     BlockPos pos = buildBlock.getPos();
                     if (pos.getY() != minBuildHeight) continue;
 
-                    Item item = BuildBlockParse.parseBlock(buildBlock.getState().getBlock()).getItem();
+                    Item item = BuildBlockParse.parseBlock(buildBlock.getState().getBlock(), builderEntity.getCommandSenderWorld()).getItem();
                     if(item == null){
                         if(builderEntity.getOwner() != null) builderEntity.getOwner().sendSystemMessage(Component.literal("Could not found item for " + buildBlock.getState().getBlock().getName() + " i, will skip this block." ));
                         builderEntity.currentBuildArea.removeBuildBlockToPlace(pos);
@@ -222,23 +228,38 @@ public class BuilderWorkGoal extends Goal {
                 }
 
                 if (stackToPlace.isEmpty()) {
+                    // Nothing placeable in inventory right now. Prefetch several base
+                    // materials at once (look-ahead over the whole structure) so the
+                    // builder makes far fewer storage trips.
                     List<ItemStack> neededItems = builderEntity.currentBuildArea.getRequiredMaterials();
                     neededItems.sort(Comparator.comparingInt(ItemStack::getCount).reversed());
 
-                    Set<Item> allowedItems = builderEntity.currentBuildArea.stackToPlace.stream()
+                    // The current level must be servable first, so make sure at least
+                    // one of its materials is among what we request: prioritise items
+                    // needed on this level, then fall back to the rest of the build.
+                    Set<Item> currentLevelItems = builderEntity.currentBuildArea.stackToPlace.stream()
                             .filter(bb -> bb.getPos().getY() == minBuildHeight)
-                            .map(bb -> BuildBlockParse.parseBlock(bb.getState().getBlock()).getItem())
+                            .map(bb -> BuildBlockParse.parseBlock(bb.getState().getBlock(), builderEntity.getCommandSenderWorld()).getItem())
                             .collect(Collectors.toSet());
 
-                    neededItems.removeIf(stack -> !allowedItems.contains(stack.getItem()));
+                    neededItems.sort(Comparator
+                            .comparing((ItemStack s) -> !currentLevelItems.contains(s.getItem()))
+                            .thenComparing(Comparator.comparingInt(ItemStack::getCount).reversed()));
 
-                    if (!neededItems.isEmpty()) {
-                        ItemStack neededItem = neededItems.get(0);
-                        int amount = Math.min(64, neededItem.getCount());
+                    int requested = 0;
+                    for (ItemStack neededItem : neededItems) {
+                        if (requested >= PREFETCH_MATERIAL_BUDGET) break;
 
+                        // Skip materials we already carry enough of to avoid pointless fetches.
+                        if (builderEntity.getInventory().hasAnyMatching(itemStack -> itemStack.is(neededItem.getItem()))) {
+                            continue;
+                        }
+
+                        int amount = Math.min(PREFETCH_STACK_LIMIT, neededItem.getCount());
                         builderEntity.addNeededItem(new NeededItem(
                                 itemStack -> itemStack.is(neededItem.getItem()), amount, true
                         ));
+                        requested++;
                     }
                 }
 
@@ -526,14 +547,16 @@ public class BuilderWorkGoal extends Goal {
                     return true;
                 }
 
-                BuildBlockParse blockParse = BuildBlockParse.parseBlock(buildingState.getBlock());
+                BuildBlockParse blockParse = BuildBlockParse.parseBlock(buildingState.getBlock(), builderEntity.getCommandSenderWorld());
                 ItemStack buildingItem = builderEntity.getMatchingItem(itemStack -> itemStack.is(blockParse.getItem()));
                 if(buildingItem != null){
                     if(!builderEntity.getMainHandItem().is(buildingItem.getItem())){
                         builderEntity.switchMainHandItem(itemStack -> itemStack.is(buildingItem.getItem()));
                     }
                     //CHECK IF IT WAS PARSED TO KEEP THE BLOCK-ROTATIONS OF NOT EFFECTED ONES
-                    if(blockParse.wasParsed() && buildingItem.getItem() instanceof BlockItem blockItem){
+                    //placeAsBase = true means the base item is also placed as its block (grass -> dirt).
+                    //For material-only substitutions (oak_stairs -> oak_planks) we keep the target block.
+                    if(blockParse.placeAsBase() && buildingItem.getItem() instanceof BlockItem blockItem){
                         buildingState = blockItem.getBlock().defaultBlockState();
                     }
 

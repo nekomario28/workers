@@ -342,7 +342,7 @@ public class BuildArea extends AbstractWorkAreaEntity {
             BlockState state = NbtUtils.readBlockState(BuiltInRegistries.BLOCK.asLookup(), stateTag);
 
             Block block = state.getBlock();
-            Item item = BuildBlockParse.parseBlock(block).getItem();
+            Item item = BuildBlockParse.parseBlock(block, this.getCommandSenderWorld()).getItem();
 
             if (state.hasProperty(BlockStateProperties.DOUBLE_BLOCK_HALF)) {
                 DoubleBlockHalf half = state.getValue(BlockStateProperties.DOUBLE_BLOCK_HALF);
@@ -422,4 +422,3 @@ public class BuildArea extends AbstractWorkAreaEntity {
         stackToPlaceMultiBlock.removeIf(buildBlock -> buildBlock.getPos().equals(blockPos));
     }
 }
-
