@@ -347,7 +347,7 @@ public class FarmerWorkGoal extends Goal {
                         return false;
                     }
                 }
-                else if(FarmersDelight.plantRice((ServerLevel) farmer.getCommandSenderWorld(), blockPos, seedFromInv)){
+                else if(FarmersDelight.plantRice((ServerLevel) farmer.getCommandSenderWorld(), blockPos, seedFromInv, farmer.getOwnerFakeProfile(FARMER_PICK_PROFILE))){
                     farmer.getCommandSenderWorld().playSound(null, blockPos.getX(), blockPos.getY(), blockPos.getZ(), SoundEvents.CROP_PLANTED, SoundSource.BLOCKS, 1.0F, 1.0F);
                     seedFromInv.shrink(1);
                     this.farmer.swing(InteractionHand.MAIN_HAND);
@@ -482,7 +482,7 @@ public class FarmerWorkGoal extends Goal {
         Level level = farmer.getCommandSenderWorld();
         if (!(level instanceof ServerLevel serverLevel)) return;
 
-        FakePlayer fake = FakePlayerFactory.get(serverLevel, FARMER_PICK_PROFILE);
+        FakePlayer fake = FakePlayerFactory.get(serverLevel, farmer.getOwnerFakeProfile(FARMER_PICK_PROFILE));
         fake.setPos(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5);
         fake.setItemInHand(InteractionHand.MAIN_HAND, ItemStack.EMPTY);
 
@@ -503,7 +503,7 @@ public class FarmerWorkGoal extends Goal {
 
         BlockPos soilPos = targetPos.below();
 
-        FakePlayer fake = FakePlayerFactory.get(serverLevel, FARMER_PICK_PROFILE);
+        FakePlayer fake = FakePlayerFactory.get(serverLevel, farmer.getOwnerFakeProfile(FARMER_PICK_PROFILE));
         fake.setPos(targetPos.getX() + 0.5, targetPos.getY(), targetPos.getZ() + 0.5);
 
         ItemStack single = seed.copy();

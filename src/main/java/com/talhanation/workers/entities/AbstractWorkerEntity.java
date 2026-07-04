@@ -1,6 +1,7 @@
 package com.talhanation.workers.entities;
 
 import com.google.common.collect.ImmutableSet;
+import com.mojang.authlib.GameProfile;
 import com.talhanation.recruits.config.RecruitsClientConfig;
 import com.talhanation.recruits.entities.AbstractChunkLoaderEntity;
 import com.talhanation.workers.entities.ai.*;
@@ -436,6 +437,28 @@ public abstract class AbstractWorkerEntity extends AbstractChunkLoaderEntity {
      */
     public boolean canGoHomeNow() {
         return true;
+    }
+
+    /**
+     * Builds a GameProfile from this worker's OWNER (UUID, plus name if online).
+     * FakePlayer-based actions (planting/harvesting via useOn, DynamicTrees felling)
+     * go through claim protection, and a generic fake profile has no permissions.
+     * Acting under the owner's identity makes claim protection allow it. Falls back
+     * to the given profile when there is no owner.
+     */
+    public GameProfile getOwnerFakeProfile(GameProfile fallback) {
+        UUID ownerUUID = this.getOwnerUUID();
+        if (ownerUUID == null) {
+            return fallback;
+        }
+
+        String ownerName = fallback.getName();
+        Player owner = this.getOwner();
+        if (owner != null) {
+            ownerName = owner.getGameProfile().getName();
+        }
+
+        return new GameProfile(ownerUUID, ownerName);
     }
 
     public void notifyOwner(Component message) {

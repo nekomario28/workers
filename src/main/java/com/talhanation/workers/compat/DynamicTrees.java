@@ -6,6 +6,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
@@ -131,12 +132,27 @@ public class DynamicTrees {
     }
 
     public static void fellTree(ServerLevel level, BlockPos pos, LumberjackEntity lumberjack) {
-        FakePlayer fakePlayer = FakePlayerFactory.get(level, LUMBERJACK_FAKE_PROFILE);
+        FakePlayer fakePlayer = FakePlayerFactory.get(level, getFellProfile(lumberjack));
         fakePlayer.setPos(lumberjack.getX(), lumberjack.getY(), lumberjack.getZ());
 
         ItemStack tool = lumberjack.getMainHandItem().copy();
         fakePlayer.setItemInHand(InteractionHand.MAIN_HAND, tool);
 
         fakePlayer.gameMode.destroyBlock(pos);
+    }
+
+    private static GameProfile getFellProfile(LumberjackEntity lumberjack) {
+        UUID ownerUUID = lumberjack.getOwnerUUID();
+        if (ownerUUID == null) {
+            return LUMBERJACK_FAKE_PROFILE;
+        }
+
+        String ownerName = "WorkerLumberjack";
+        Player owner = lumberjack.getOwner();
+        if (owner != null) {
+            ownerName = owner.getGameProfile().getName();
+        }
+
+        return new GameProfile(ownerUUID, ownerName);
     }
 }

@@ -117,8 +117,8 @@ public class FarmersDelight {
         return 0;
     }
 
-    public static boolean plantRice(ServerLevel level, BlockPos waterPos, ItemStack rice) {
-        FakePlayer fakePlayer = FakePlayerFactory.get(level, FARMER_FAKE_PROFILE);
+    public static boolean plantRice(ServerLevel level, BlockPos waterPos, ItemStack rice, GameProfile profile) {
+        FakePlayer fakePlayer = FakePlayerFactory.get(level, profile != null ? profile : FARMER_FAKE_PROFILE);
         fakePlayer.setPos(waterPos.getX() + 0.5, waterPos.getY() + 1, waterPos.getZ() + 0.5);
 
         ItemStack single = rice.copy();
