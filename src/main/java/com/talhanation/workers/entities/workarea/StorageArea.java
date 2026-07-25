@@ -16,8 +16,8 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.*;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
-import net.minecraftforge.api.distmarker.Dist;
-import net.minecraftforge.api.distmarker.OnlyIn;
+import net.neoforged.api.distmarker.Dist;
+import net.neoforged.api.distmarker.OnlyIn;
 
 import java.util.*;
 
@@ -29,9 +29,9 @@ public class StorageArea extends AbstractWorkAreaEntity implements IPermissionAr
     public StorageArea(EntityType<?> type, Level level) {
         super(type, level);
     }
-    protected void defineSynchedData() {
-        super.defineSynchedData();
-        this.entityData.define(STORAGE_TYPES, 0);
+    protected void defineSynchedData(net.minecraft.network.syncher.SynchedEntityData.Builder builder) {
+        super.defineSynchedData(builder);
+        builder.define(STORAGE_TYPES, 0);
     }
 
     @Override
