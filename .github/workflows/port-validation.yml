@@ -1,0 +1,70 @@
+name: NeoForge 1.21.1 Port Validation
+on:
+  push:
+    branches: [port/neoforge-1.21.1]
+  pull_request:
+  workflow_dispatch:
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: workers-neoforge-1.21.1
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Build Recruits dependency
+        run: |
+          git clone --depth 1 --branch port/neoforge-1.21.1 https://github.com/nekomario28/recruits.git recruits-neoforge-1.21.1
+          cd recruits-neoforge-1.21.1
+          chmod +x gradlew
+          ./gradlew clean build --stacktrace
+      - name: Build Workers
+        working-directory: workers-neoforge-1.21.1
+        run: |
+          chmod +x gradlew
+          ./gradlew clean build --stacktrace
+      - name: Server smoke test
+        shell: bash
+        working-directory: workers-neoforge-1.21.1
+        run: |
+          mkdir -p run
+          echo eula=true > run/eula.txt
+          timeout 240s ./gradlew runServer > server-smoke.log 2>&1 & pid=$!
+          ready=0
+          for i in $(seq 1 120); do
+            grep -Eq 'Done \([0-9.]+s\)!|For help, type "help"' server-smoke.log && ready=1 && break
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 2
+          done
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          cat server-smoke.log
+          test "$ready" -eq 1
+      - name: Client smoke test
+        shell: bash
+        working-directory: workers-neoforge-1.21.1
+        run: |
+          timeout 240s xvfb-run -a ./gradlew runClient > client-smoke.log 2>&1 & pid=$!
+          ready=0
+          for i in $(seq 1 120); do
+            grep -Eq 'Sound engine started|OpenAL initialized|Reloading ResourceManager|Created: [0-9]+x[0-9]+' client-smoke.log && ready=1 && break
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 2
+          done
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          cat client-smoke.log
+          test "$ready" -eq 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: workers-validation-logs
+          path: |
+            workers-neoforge-1.21.1/server-smoke.log
+            workers-neoforge-1.21.1/client-smoke.log
+            workers-neoforge-1.21.1/run/logs/**
+            workers-neoforge-1.21.1/build/reports/**
