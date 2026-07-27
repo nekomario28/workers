@@ -1,2 +1,2 @@
 Temporary trigger for source-based NeoForge 1.21.1 Workers GameTests.
-Run exact-base Recruits and Workers audit source under ModDevGradle gameTestServer.
+Retry after fixing patch reconstruction against exact source bases.
