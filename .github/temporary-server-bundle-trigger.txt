@@ -1,2 +1,2 @@
 Temporary trigger for NeoForge 1.21.1 Workers GameTests.
-Run 24: build the atomic Recruits fix, run all seven tests, and commit the verified Workers dedicated-server compatibility patch.
+Run 25: execute the isolated verified Workers source commit job and repeat the seven-test suite.
