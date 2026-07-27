@@ -1,2 +1,2 @@
-Temporary trigger for dedicated-server and GameTest runtime bundle generation.
-Retry: build only the GameTest harness and NeoForge server runtime.
+Temporary trigger for source-based NeoForge 1.21.1 Workers GameTests.
+Run exact-base Recruits and Workers audit source under ModDevGradle gameTestServer.
