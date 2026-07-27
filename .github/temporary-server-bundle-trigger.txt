@@ -1,2 +1,2 @@
-Temporary trigger for source-based NeoForge 1.21.1 Workers GameTests.
-Retry with Python Base64 and XZ patch reconstruction plus uploaded evidence logs.
+Temporary trigger for NeoForge 1.21.1 Workers GameTests.
+Clone the port branches, apply only dedicated-server supplemental fixes, and run ModDevGradle gameTestServer.
