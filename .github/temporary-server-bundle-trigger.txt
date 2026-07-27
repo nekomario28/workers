@@ -1,2 +1,1 @@
-Temporary trigger for NeoForge 1.21.1 Workers GameTests.
-Final gate: clone only committed Recruits and Workers port branches and pass all seven GameTests with no supplemental source patch.
+Temporary cleanup trigger. Final committed-source evidence has been captured and the branch may now be deleted.
