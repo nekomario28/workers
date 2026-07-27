@@ -1,1 +1,2 @@
 Temporary trigger for dedicated-server and GameTest runtime bundle generation.
+Retry: build only the GameTest harness and NeoForge server runtime.
