@@ -4,7 +4,7 @@ neoForge {
         gameTestServer {
             type = "gameTestServer"
             gameDirectory = project.file('run-gametest')
-            systemProperty 'neoforge.enabledGameTestNamespaces', 'workers'
+            systemProperty 'neoforge.enabledGameTestNamespaces', 'workers,minecraft'
         }
     }
 }
