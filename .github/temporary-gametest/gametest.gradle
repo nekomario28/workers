@@ -2,7 +2,7 @@
 neoForge {
     runs {
         gameTestServer {
-            gameTestServer()
+            type = "gameTestServer"
             gameDirectory = project.file('run-gametest')
             systemProperty 'neoforge.enabledGameTestNamespaces', 'workers'
         }
