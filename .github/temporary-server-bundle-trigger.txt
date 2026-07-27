@@ -1,2 +1,2 @@
 Temporary trigger for NeoForge 1.21.1 Workers GameTests.
-Run 25: execute the isolated verified Workers source commit job and repeat the seven-test suite.
+Final gate: clone only committed Recruits and Workers port branches and pass all seven GameTests with no supplemental source patch.
