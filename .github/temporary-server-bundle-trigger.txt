@@ -1,2 +1,2 @@
 Temporary trigger for NeoForge 1.21.1 Workers GameTests.
-Clone the port branches, apply only dedicated-server supplemental fixes, and run ModDevGradle gameTestServer.
+Run 21: generate the required empty structure template, execute all four tests, and collect crash reports.
