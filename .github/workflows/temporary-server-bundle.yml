@@ -1,0 +1,271 @@
+name: Temporary server bundle
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-server-bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out trigger branch
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Build Recruits dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch port/neoforge-1.21.1 https://github.com/nekomario28/recruits.git "$RUNNER_TEMP/recruits-neoforge-1.21.1"
+          cd "$RUNNER_TEMP/recruits-neoforge-1.21.1"
+          chmod +x gradlew
+          ./gradlew --no-daemon clean shadowJar
+          RECRUITS_JAR="$(find build/libs -maxdepth 1 -name '*-all.jar' -print -quit)"
+          test -n "$RECRUITS_JAR"
+          cp "$RECRUITS_JAR" "$RUNNER_TEMP/recruits.jar"
+
+      - name: Create GameTest harness project
+        shell: bash
+        run: |
+          set -euo pipefail
+          TESTMOD="$RUNNER_TEMP/workers-test"
+          mkdir -p "$TESTMOD/src/main/java/com/nekomario28/workerstest"
+          mkdir -p "$TESTMOD/src/main/resources/META-INF"
+
+          cat > "$TESTMOD/settings.gradle" <<'EOF'
+          pluginManagement {
+              repositories {
+                  gradlePluginPortal()
+                  maven { url = 'https://maven.neoforged.net/releases' }
+              }
+          }
+          EOF
+
+          cat > "$TESTMOD/build.gradle" <<'EOF'
+          plugins {
+              id 'java'
+              id 'net.neoforged.moddev' version '2.0.107'
+          }
+
+          version = '1.0.0'
+          group = 'com.nekomario28.workerstest'
+
+          base {
+              archivesName = 'workers-test'
+          }
+
+          java.toolchain.languageVersion = JavaLanguageVersion.of(21)
+
+          neoForge {
+              version = '21.1.219'
+              mods {
+                  workers_test {
+                      sourceSet sourceSets.main
+                  }
+              }
+          }
+          EOF
+
+          cat > "$TESTMOD/src/main/resources/META-INF/neoforge.mods.toml" <<'EOF'
+          modLoader="javafml"
+          loaderVersion="[4,)"
+          license="All Rights Reserved"
+
+          [[mods]]
+          modId="workers_test"
+          version="1.0.0"
+          displayName="Workers GameTest Harness"
+          authors="nekomario28"
+          description='''Temporary dedicated-server GameTest harness for the Workers NeoForge 1.21.1 port.'''
+
+          [[dependencies.workers_test]]
+          modId="neoforge"
+          type="required"
+          versionRange="[21.1,)"
+          ordering="NONE"
+          side="SERVER"
+
+          [[dependencies.workers_test]]
+          modId="minecraft"
+          type="required"
+          versionRange="[1.21.1,1.22)"
+          ordering="NONE"
+          side="SERVER"
+
+          [[dependencies.workers_test]]
+          modId="recruits"
+          type="required"
+          versionRange="[1.15.0,)"
+          ordering="AFTER"
+          side="SERVER"
+
+          [[dependencies.workers_test]]
+          modId="workers"
+          type="required"
+          versionRange="[2.0.3,)"
+          ordering="AFTER"
+          side="SERVER"
+          EOF
+
+          cat > "$TESTMOD/src/main/java/com/nekomario28/workerstest/WorkersTestMod.java" <<'EOF'
+          package com.nekomario28.workerstest;
+
+          import net.neoforged.fml.common.Mod;
+
+          @Mod(WorkersTestMod.MOD_ID)
+          public final class WorkersTestMod {
+              public static final String MOD_ID = "workers_test";
+
+              public WorkersTestMod() {
+              }
+          }
+          EOF
+
+          cat > "$TESTMOD/src/main/java/com/nekomario28/workerstest/WorkersGameTests.java" <<'EOF'
+          package com.nekomario28.workerstest;
+
+          import net.minecraft.core.BlockPos;
+          import net.minecraft.core.registries.BuiltInRegistries;
+          import net.minecraft.gametest.framework.GameTest;
+          import net.minecraft.gametest.framework.GameTestHelper;
+          import net.minecraft.nbt.CompoundTag;
+          import net.minecraft.resources.ResourceLocation;
+          import net.minecraft.world.Container;
+          import net.minecraft.world.entity.Entity;
+          import net.minecraft.world.entity.EntityType;
+          import net.neoforged.fml.ModList;
+          import net.neoforged.neoforge.gametest.GameTestHolder;
+          import net.neoforged.neoforge.gametest.PrefixGameTestTemplate;
+
+          import java.lang.reflect.Method;
+
+          @GameTestHolder(WorkersTestMod.MOD_ID)
+          @PrefixGameTestTemplate(false)
+          public final class WorkersGameTests {
+              private WorkersGameTests() {
+              }
+
+              @GameTest(templateNamespace = "minecraft", template = "empty", timeoutTicks = 40)
+              public static void requiredModsLoad(GameTestHelper helper) {
+                  helper.assertTrue(ModList.get().isLoaded("recruits"), "Recruits must load on the dedicated server");
+                  helper.assertTrue(ModList.get().isLoaded("workers"), "Workers must load on the dedicated server");
+                  helper.succeed();
+              }
+
+              @GameTest(templateNamespace = "minecraft", template = "empty", timeoutTicks = 40)
+              public static void workersEntityTypesRegister(GameTestHelper helper) {
+                  assertRegistered(helper, "storagearea");
+                  assertRegistered(helper, "farmer");
+                  assertRegistered(helper, "merchant");
+                  helper.succeed();
+              }
+
+              @GameTest(templateNamespace = "minecraft", template = "empty", timeoutTicks = 80)
+              public static void storageAreaNbtRoundTrip(GameTestHelper helper) {
+                  try {
+                      EntityType<?> type = getType(helper, "storagearea");
+                      Entity storage = type.create(helper.getLevel());
+                      helper.assertTrue(storage != null, "StorageArea EntityType returned null");
+
+                      Method setStorageTypes = storage.getClass().getMethod("setStorageTypes", int.class);
+                      setStorageTypes.invoke(storage, 8);
+                      storage.setPos(helper.absolutePos(new BlockPos(1, 1, 1)).getCenter());
+                      helper.assertTrue(helper.getLevel().addFreshEntity(storage), "StorageArea could not be added to the level");
+
+                      CompoundTag saved = storage.saveWithoutId(new CompoundTag());
+                      helper.assertValueEqual(saved.getInt("StorageTypes"), 8, "StorageTypes must be saved");
+
+                      Entity restored = type.create(helper.getLevel());
+                      helper.assertTrue(restored != null, "Restored StorageArea EntityType returned null");
+                      restored.load(saved);
+                      CompoundTag roundTrip = restored.saveWithoutId(new CompoundTag());
+                      helper.assertValueEqual(roundTrip.getInt("StorageTypes"), 8, "StorageTypes must survive NBT reload");
+                      helper.succeed();
+                  } catch (ReflectiveOperationException exception) {
+                      throw new AssertionError("StorageArea public API could not be invoked", exception);
+                  }
+              }
+
+              @GameTest(templateNamespace = "minecraft", template = "empty", timeoutTicks = 80)
+              public static void storageAreaContainerContract(GameTestHelper helper) {
+                  EntityType<?> type = getType(helper, "storagearea");
+                  Entity storage = type.create(helper.getLevel());
+                  helper.assertTrue(storage instanceof Container, "StorageArea must implement Container");
+                  Container container = (Container) storage;
+                  helper.assertTrue(container.getContainerSize() >= 0, "Container size must not be negative");
+                  helper.assertTrue(container.isEmpty(), "A new StorageArea without storage blocks must be empty");
+                  container.setChanged();
+                  container.clearContent();
+                  helper.succeed();
+              }
+
+              private static EntityType<?> getType(GameTestHelper helper, String path) {
+                  ResourceLocation id = ResourceLocation.fromNamespaceAndPath("workers", path);
+                  EntityType<?> type = BuiltInRegistries.ENTITY_TYPE.get(id);
+                  helper.assertTrue(type != null, "Missing entity type " + id);
+                  helper.assertValueEqual(BuiltInRegistries.ENTITY_TYPE.getKey(type), id, "Wrong entity type registered for " + id);
+                  return type;
+              }
+
+              private static void assertRegistered(GameTestHelper helper, String path) {
+                  getType(helper, path);
+              }
+          }
+          EOF
+
+      - name: Build GameTest harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          TESTMOD="$RUNNER_TEMP/workers-test"
+          cd "$TESTMOD"
+          gradle --no-daemon clean build
+          TEST_JAR="$(find build/libs -maxdepth 1 -name 'workers-test-*.jar' -print -quit)"
+          test -n "$TEST_JAR"
+          cp "$TEST_JAR" "$RUNNER_TEMP/workers-test.jar"
+
+      - name: Install NeoForge dedicated server
+        shell: bash
+        run: |
+          set -euo pipefail
+          SERVER="$RUNNER_TEMP/neoforge-server"
+          mkdir -p "$SERVER"
+          cd "$SERVER"
+          curl --fail --location --output neoforge-installer.jar \
+            https://maven.neoforged.net/releases/net/neoforged/neoforge/21.1.219/neoforge-21.1.219-installer.jar
+          java -jar neoforge-installer.jar --installServer
+          rm neoforge-installer.jar
+          mkdir -p mods
+          cp "$RUNNER_TEMP/recruits.jar" mods/recruits.jar
+          cp "$RUNNER_TEMP/workers-test.jar" mods/workers-test.jar
+          printf 'eula=true\n' > eula.txt
+          cat > server.properties <<'EOF'
+          online-mode=false
+          allow-flight=true
+          enable-command-block=true
+          level-name=workers-gametest
+          max-tick-time=120000
+          view-distance=5
+          simulation-distance=5
+          EOF
+          tar -czf "$RUNNER_TEMP/neoforge-21.1.219-workers-test-server.tar.gz" .
+
+      - name: Upload server bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: neoforge-workers-test-server
+          path: ${{ runner.temp }}/neoforge-21.1.219-workers-test-server.tar.gz
+          if-no-files-found: error
+          retention-days: 1
