@@ -1,0 +1,10 @@
+
+neoForge {
+    runs {
+        gameTestServer {
+            gameTestServer()
+            gameDirectory = project.file('run-gametest')
+            systemProperty 'neoforge.enabledGameTestNamespaces', 'workers'
+        }
+    }
+}
