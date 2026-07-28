@@ -6,6 +6,7 @@ import com.talhanation.workers.init.ModEntityTypes;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.entity.Entity;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Blocks;
@@ -34,6 +35,7 @@ public final class FinalRestartProbe {
     private static int ticks;
     private static boolean completed;
     private static boolean writePrepared;
+    private static StorageArea preparedStorage;
 
     private FinalRestartProbe() {
     }
@@ -43,12 +45,14 @@ public final class FinalRestartProbe {
         ticks = 0;
         completed = false;
         writePrepared = false;
+        preparedStorage = null;
+        forceChunk(event.getServer().overworld());
         LOGGER.info("WORKERS_FINAL_RESTART_PROCESS_STARTED phaseExists={}", Files.exists(PHASE));
     }
 
     @SubscribeEvent
     public static void onTick(ServerTickEvent.Post event) {
-        if (completed || ++ticks < 40) {
+        if (completed || ++ticks < 60) {
             return;
         }
         MinecraftServer server = event.getServer();
@@ -78,6 +82,7 @@ public final class FinalRestartProbe {
 
     private static void prepareWrite(MinecraftServer server) {
         ServerLevel level = server.overworld();
+        forceChunk(level);
         level.getChunkAt(CHEST_POS);
         level.setBlockAndUpdate(CHEST_POS.below(), Blocks.STONE.defaultBlockState());
         level.setBlockAndUpdate(CHEST_POS, Blocks.CHEST.defaultBlockState());
@@ -96,21 +101,31 @@ public final class FinalRestartProbe {
         storage.setStorageTypes(8);
         storage.setPos(CHEST_POS.getX() + 0.5D, CHEST_POS.getY() + 1.0D, CHEST_POS.getZ() + 0.5D);
         require(level.addFreshEntity(storage), "StorageArea could not be added");
+        preparedStorage = storage;
         storage.scanStorageBlocks();
         verifyBridge(storage);
-        LOGGER.info("WORKERS_FINAL_RESTART_WRITE_PREPARED uuid={} storageTypes={} slots={} wheat0={} wheat1={}",
-                storage.getUUID(), storage.getStorageMask(storage.getStorageTypes()),
-                storage.getContainerSize(), storage.getItem(0).getCount(), storage.getItem(1).getCount());
+        LOGGER.info("WORKERS_FINAL_RESTART_WRITE_PREPARED uuid={} removed={} reason={} storageTypes={} slots={} wheat0={} wheat1={}",
+                storage.getUUID(), storage.isRemoved(), storage.getRemovalReason(),
+                storage.getStorageMask(storage.getStorageTypes()), storage.getContainerSize(),
+                storage.getItem(0).getCount(), storage.getItem(1).getCount());
     }
 
     private static void finishWrite(MinecraftServer server) throws Exception {
         ServerLevel level = server.overworld();
+        forceChunk(level);
         level.getChunkAt(CHEST_POS);
         ChestBlockEntity chest = requireChest(level);
         require(chest.getItem(0).is(Items.WHEAT) && chest.getItem(0).getCount() == 64,
                 "Prepared chest slot 0 changed before save");
         require(chest.getItem(1).is(Items.WHEAT) && chest.getItem(1).getCount() == 6,
                 "Prepared chest slot 1 changed before save");
+
+        Entity byUuid = preparedStorage == null ? null : level.getEntity(preparedStorage.getUUID());
+        LOGGER.info("WORKERS_FINAL_RESTART_PRE_SAVE_STATE retained={} removed={} reason={} byUuid={}",
+                preparedStorage != null,
+                preparedStorage != null && preparedStorage.isRemoved(),
+                preparedStorage == null ? null : preparedStorage.getRemovalReason(),
+                byUuid == null ? null : byUuid.getClass().getName());
 
         List<StorageArea> storages = findStorages(level);
         require(storages.size() == 1, "Expected one registered StorageArea before save, found " + storages.size());
@@ -131,6 +146,7 @@ public final class FinalRestartProbe {
 
     private static void verify(MinecraftServer server) throws Exception {
         ServerLevel level = server.overworld();
+        forceChunk(level);
         level.getChunkAt(CHEST_POS);
         ChestBlockEntity chest = requireChest(level);
         require(chest.getItem(0).is(Items.WHEAT) && chest.getItem(0).getCount() == 64,
@@ -156,6 +172,12 @@ public final class FinalRestartProbe {
                 storage.getUUID(), storage.getStorageMask(storage.getStorageTypes()),
                 storage.getContainerSize(), storage.getItem(0).getCount(), storage.getItem(1).getCount());
         server.halt(false);
+    }
+
+    private static void forceChunk(ServerLevel level) {
+        int chunkX = CHEST_POS.getX() >> 4;
+        int chunkZ = CHEST_POS.getZ() >> 4;
+        level.setChunkForced(chunkX, chunkZ, true);
     }
 
     private static List<StorageArea> findStorages(ServerLevel level) {
