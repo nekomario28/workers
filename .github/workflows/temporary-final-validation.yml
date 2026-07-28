@@ -1,0 +1,196 @@
+name: Temporary Workers Final Validation
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  final-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+
+    steps:
+      - name: Check out validation branch
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Build exact Recruits source
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/final-sources"
+          mkdir -p "$ROOT"
+          git clone https://github.com/nekomario28/recruits.git "$ROOT/recruits-neoforge-1.21.1"
+          cd "$ROOT/recruits-neoforge-1.21.1"
+          git checkout --detach 430599eb53db39d67baf494dda9f22827adb2068
+          test "$(git rev-parse HEAD)" = "430599eb53db39d67baf494dda9f22827adb2068"
+          chmod +x gradlew
+          ./gradlew --no-daemon clean shadowJar --stacktrace 2>&1 | tee "$RUNNER_TEMP/recruits-build.log"
+          RECRUITS_JAR="$(find build/libs -maxdepth 1 -name '*-all.jar' -print -quit)"
+          test -n "$RECRUITS_JAR"
+          cp "$RECRUITS_JAR" "$RUNNER_TEMP/recruits-final.jar"
+
+      - name: Run seven committed-source GameTests
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/final-sources"
+          WORKERS="$ROOT/workers-gametest"
+          git clone https://github.com/nekomario28/workers.git "$WORKERS"
+          cd "$WORKERS"
+          git checkout --detach 3859ceae9aa34464c3564597009608403a9fe8ea
+          test "$(git rev-parse HEAD)" = "3859ceae9aa34464c3564597009608403a9fe8ea"
+          chmod +x gradlew
+          mkdir -p src/main/java/com/talhanation/workers/gametest
+          cp "$GITHUB_WORKSPACE/.github/temporary-final/WorkersFinalGameTests.java" \
+            src/main/java/com/talhanation/workers/gametest/WorkersFinalGameTests.java
+          cat >> build.gradle <<'GRADLE'
+
+          neoForge {
+              runs {
+                  gameTestServer {
+                      type = "gameTestServer"
+                      gameDirectory = project.file('run-final-gametest')
+                      systemProperty 'neoforge.enabledGameTestNamespaces', 'workers,minecraft'
+                  }
+              }
+          }
+          GRADLE
+          mkdir -p src/main/resources/data/minecraft/structure
+          python3 - <<'PY'
+          from pathlib import Path
+          import gzip, struct
+          def u16(v): return struct.pack('>H', v)
+          def i32(v): return struct.pack('>i', v)
+          def name(v):
+              b=v.encode(); return u16(len(b))+b
+          def tint(k,v): return b'\x03'+name(k)+i32(v)
+          def tstr(k,v):
+              b=v.encode(); return b'\x08'+name(k)+u16(len(b))+b
+          def tli(k,vs): return b'\x09'+name(k)+b'\x03'+i32(len(vs))+b''.join(i32(v) for v in vs)
+          def comp(tags): return b''.join(tags)+b'\x00'
+          def tlc(k,vs): return b'\x09'+name(k)+b'\x0a'+i32(len(vs))+b''.join(vs)
+          root=b'\x0a'+name('')+comp([
+              tint('DataVersion',3955),tli('size',[7,3,7]),
+              tlc('palette',[comp([tstr('Name','minecraft:stone')])]),
+              tlc('blocks',[comp([tli('pos',[0,0,0]),tint('state',0)])]),
+              tlc('entities',[])])
+          Path('src/main/resources/data/minecraft/structure/empty.nbt').write_bytes(gzip.compress(root,mtime=0))
+          PY
+          ./gradlew --no-daemon runGameTestServer --stacktrace --info 2>&1 | tee "$RUNNER_TEMP/workers-final-gametest.log"
+          grep -F "All 7 required tests passed" "$RUNNER_TEMP/workers-final-gametest.log"
+
+      - name: Build dedicated restart probe JAR
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/final-sources"
+          WORKERS="$ROOT/workers-dedicated"
+          git clone https://github.com/nekomario28/workers.git "$WORKERS"
+          cd "$WORKERS"
+          git checkout --detach 3859ceae9aa34464c3564597009608403a9fe8ea
+          test "$(git rev-parse HEAD)" = "3859ceae9aa34464c3564597009608403a9fe8ea"
+          chmod +x gradlew
+          mkdir -p src/main/java/com/talhanation/workers/finaltest
+          cp "$GITHUB_WORKSPACE/.github/temporary-final/FinalRestartProbe.java" \
+            src/main/java/com/talhanation/workers/finaltest/FinalRestartProbe.java
+          ./gradlew --no-daemon clean shadowJar --stacktrace 2>&1 | tee "$RUNNER_TEMP/workers-dedicated-build.log"
+          WORKERS_JAR="$(find build/libs -maxdepth 1 -name '*-all.jar' -print -quit)"
+          test -n "$WORKERS_JAR"
+          cp "$WORKERS_JAR" "$RUNNER_TEMP/workers-final-restart.jar"
+
+      - name: Install NeoForge dedicated server
+        shell: bash
+        run: |
+          set -euo pipefail
+          SERVER="$RUNNER_TEMP/workers-final-server"
+          mkdir -p "$SERVER"
+          cd "$SERVER"
+          curl --fail --location --retry 3 --output neoforge-installer.jar \
+            https://maven.neoforged.net/releases/net/neoforged/neoforge/21.1.219/neoforge-21.1.219-installer.jar
+          java -jar neoforge-installer.jar --installServer 2>&1 | tee "$RUNNER_TEMP/server-install.log"
+          rm neoforge-installer.jar
+          mkdir -p mods
+          cp "$RUNNER_TEMP/recruits-final.jar" mods/recruits-final.jar
+          cp "$RUNNER_TEMP/workers-final-restart.jar" mods/workers-final-restart.jar
+          printf 'eula=true\n' > eula.txt
+          cat > server.properties <<'PROPERTIES'
+          online-mode=false
+          allow-flight=true
+          enable-command-block=true
+          level-name=workers-final-restart-world
+          max-tick-time=120000
+          view-distance=5
+          simulation-distance=5
+          spawn-protection=0
+          PROPERTIES
+
+      - name: Dedicated process 1 - write and save
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/workers-final-server"
+          timeout 240s bash run.sh nogui 2>&1 | tee "$RUNNER_TEMP/dedicated-process-1.log"
+          test "${PIPESTATUS[0]}" -eq 0
+          test -f workers-final-restart.phase
+          test ! -f workers-final-restart.fail
+          grep -F "WORKERS_FINAL_RESTART_WRITE_OK" "$RUNNER_TEMP/dedicated-process-1.log"
+          test -d workers-final-restart-world
+
+      - name: Dedicated process 2 - reload and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/workers-final-server"
+          timeout 240s bash run.sh nogui 2>&1 | tee "$RUNNER_TEMP/dedicated-process-2.log"
+          test "${PIPESTATUS[0]}" -eq 0
+          test -f workers-final-restart.pass
+          test ! -f workers-final-restart.fail
+          grep -F "WORKERS_FINAL_RESTART_VERIFY_OK" "$RUNNER_TEMP/dedicated-process-2.log"
+          grep -F "slots=27" workers-final-restart.pass
+          grep -F "wheat0=64" workers-final-restart.pass
+          grep -F "wheat1=6" workers-final-restart.pass
+          grep -F "storageTypes=8" workers-final-restart.pass
+
+      - name: Collect exact evidence
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          OUT="$RUNNER_TEMP/final-evidence"
+          mkdir -p "$OUT"
+          cp "$RUNNER_TEMP"/*.log "$OUT"/ 2>/dev/null || true
+          cp "$RUNNER_TEMP/workers-final-server"/workers-final-restart.* "$OUT"/ 2>/dev/null || true
+          sha256sum "$RUNNER_TEMP/recruits-final.jar" "$RUNNER_TEMP/workers-final-restart.jar" > "$OUT/jar-sha256.txt" 2>/dev/null || true
+          cat > "$OUT/manifest.json" <<'JSON'
+          {
+            "minecraft":"1.21.1",
+            "neoforge":"21.1.219",
+            "java":"21",
+            "recruits_commit":"430599eb53db39d67baf494dda9f22827adb2068",
+            "workers_commit":"3859ceae9aa34464c3564597009608403a9fe8ea",
+            "gametests_expected":7,
+            "dedicated_server_processes":2,
+            "same_world_reused":true,
+            "storage":{"slots":27,"wheat0":64,"wheat1":6,"storageTypes":8}
+          }
+          JSON
+
+      - name: Upload final evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: workers-final-two-process-validation
+          path: ${{ runner.temp }}/final-evidence
+          if-no-files-found: error
+          retention-days: 3
