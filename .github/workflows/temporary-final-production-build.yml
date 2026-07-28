@@ -1,0 +1,203 @@
+name: Temporary Final Production Build
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  production-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      RECRUITS_SHA: 1848e8ec33376f8a933945d4704b3e4c49920d8e
+      WORKERS_SHA: 3859ceae9aa34464c3564597009608403a9fe8ea
+
+    steps:
+      - name: Check out production harness
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Build clean exact Recruits JAR
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/final-production"
+          mkdir -p "$ROOT"
+          git clone https://github.com/nekomario28/recruits.git "$ROOT/recruits-neoforge-1.21.1"
+          cd "$ROOT/recruits-neoforge-1.21.1"
+          git checkout --detach "$RECRUITS_SHA"
+          test "$(git rev-parse HEAD)" = "$RECRUITS_SHA"
+          test -z "$(git status --porcelain)"
+          chmod +x gradlew
+          ./gradlew --no-daemon clean shadowJar --stacktrace 2>&1 | tee "$RUNNER_TEMP/final-recruits-build.log"
+          JAR="$(find build/libs -maxdepth 1 -name '*-all.jar' -print -quit)"
+          test -n "$JAR"
+          cp "$JAR" "$RUNNER_TEMP/recruits-1.21.1-1.15.0-final.jar"
+
+      - name: Build clean exact Workers JAR
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/final-production"
+          git clone https://github.com/nekomario28/workers.git "$ROOT/workers-neoforge-1.21.1"
+          cd "$ROOT/workers-neoforge-1.21.1"
+          git checkout --detach "$WORKERS_SHA"
+          test "$(git rev-parse HEAD)" = "$WORKERS_SHA"
+          test -z "$(git status --porcelain)"
+          chmod +x gradlew
+          ./gradlew --no-daemon clean shadowJar --stacktrace 2>&1 | tee "$RUNNER_TEMP/final-workers-build.log"
+          JAR="$(find build/libs -maxdepth 1 -name '*-all.jar' -print -quit)"
+          test -n "$JAR"
+          cp "$JAR" "$RUNNER_TEMP/workers-1.21.1-2.0.3-final.jar"
+
+      - name: Audit clean production JARs
+        shell: bash
+        run: |
+          set -euo pipefail
+          R="$RUNNER_TEMP/recruits-1.21.1-1.15.0-final.jar"
+          W="$RUNNER_TEMP/workers-1.21.1-2.0.3-final.jar"
+          OUT="$RUNNER_TEMP/final-production-audit.txt"
+          {
+            unzip -t "$R" >/dev/null
+            unzip -t "$W" >/dev/null
+            python3 - "$R" "$W" <<'PY'
+          import sys, zipfile
+          from collections import Counter
+          forbidden = (
+              '/gametest/', '/finaltest/', 'LatestClientSmokeProbe',
+              'LatestRecruitsWorkersProbe', 'RecruitsFinalRestartProbe',
+              'WorkersFinalGameTests', 'RecruitsFinalGameTests'
+          )
+          for jar in sys.argv[1:]:
+              with zipfile.ZipFile(jar) as z:
+                  names = z.namelist()
+              duplicates = [name for name,count in Counter(names).items() if count > 1]
+              temporary = [name for name in names if any(token in name for token in forbidden)]
+              print(f'{jar}: entries={len(names)} duplicate_entries={len(duplicates)} temporary_entries={len(temporary)}')
+              if duplicates:
+                  raise SystemExit('Duplicate entries:\n' + '\n'.join(duplicates[:50]))
+              if temporary:
+                  raise SystemExit('Temporary validation classes leaked:\n' + '\n'.join(temporary[:50]))
+          PY
+            if unzip -Z1 "$R" | grep -q '^de/maxhenkel/corelib/'; then
+              echo 'Recruits contains unrelocated CoreLib classes'
+              exit 1
+            fi
+            if unzip -Z1 "$W" | grep -q '^de/maxhenkel/corelib/'; then
+              echo 'Workers contains unrelocated CoreLib classes'
+              exit 1
+            fi
+            test "$(unzip -Z1 "$R" | grep -c '^de/maxhenkel/recruits/corelib/' || true)" -gt 0
+            test "$(unzip -Z1 "$W" | grep -c '^de/maxhenkel/workers/corelib/' || true)" -gt 0
+            unzip -p "$R" META-INF/neoforge.mods.toml | grep -F 'modId="recruits"'
+            unzip -p "$W" META-INF/neoforge.mods.toml | grep -F 'modId="workers"'
+            unzip -p "$W" META-INF/neoforge.mods.toml | grep -F 'modId="recruits"'
+            echo 'production_jar_audit=PASS'
+          } 2>&1 | tee "$OUT"
+
+      - name: Install NeoForge dedicated server
+        shell: bash
+        run: |
+          set -euo pipefail
+          SERVER="$RUNNER_TEMP/final-production-server"
+          mkdir -p "$SERVER"
+          cd "$SERVER"
+          curl --fail --location --retry 3 --output neoforge-installer.jar \
+            https://maven.neoforged.net/releases/net/neoforged/neoforge/21.1.219/neoforge-21.1.219-installer.jar
+          java -jar neoforge-installer.jar --installServer 2>&1 | tee "$RUNNER_TEMP/final-production-server-install.log"
+          rm neoforge-installer.jar
+          mkdir -p mods
+          cp "$RUNNER_TEMP/recruits-1.21.1-1.15.0-final.jar" mods/
+          cp "$RUNNER_TEMP/workers-1.21.1-2.0.3-final.jar" mods/
+          printf 'eula=true\n' > eula.txt
+          cat > server.properties <<'PROPERTIES'
+          online-mode=false
+          allow-flight=true
+          level-name=final-production-world
+          max-tick-time=120000
+          view-distance=5
+          simulation-distance=5
+          spawn-protection=0
+          PROPERTIES
+
+      - name: Start and gracefully stop clean production server
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/final-production-server"
+          rm -f server.stdin
+          mkfifo server.stdin
+          bash run.sh nogui < server.stdin > "$RUNNER_TEMP/final-production-dedicated.log" 2>&1 &
+          SERVER_PID=$!
+          exec 3>server.stdin
+          READY=0
+          for _ in $(seq 1 180); do
+            if grep -Fq 'Done (' "$RUNNER_TEMP/final-production-dedicated.log"; then
+              READY=1
+              break
+            fi
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          if [ "$READY" -ne 1 ]; then
+            cat "$RUNNER_TEMP/final-production-dedicated.log"
+            kill "$SERVER_PID" 2>/dev/null || true
+            exit 1
+          fi
+          printf 'stop\n' >&3
+          exec 3>&-
+          wait "$SERVER_PID"
+          test "$?" -eq 0
+          grep -F 'Done (' "$RUNNER_TEMP/final-production-dedicated.log"
+          grep -F 'Stopping server' "$RUNNER_TEMP/final-production-dedicated.log"
+          grep -F 'Saving worlds' "$RUNNER_TEMP/final-production-dedicated.log"
+          test -d final-production-world
+
+      - name: Collect production artifacts
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          OUT="$RUNNER_TEMP/final-production-artifact"
+          mkdir -p "$OUT"
+          cp "$RUNNER_TEMP/recruits-1.21.1-1.15.0-final.jar" "$OUT"/ 2>/dev/null || true
+          cp "$RUNNER_TEMP/workers-1.21.1-2.0.3-final.jar" "$OUT"/ 2>/dev/null || true
+          cp "$RUNNER_TEMP"/final-*.log "$OUT"/ 2>/dev/null || true
+          cp "$RUNNER_TEMP/final-production-audit.txt" "$OUT"/ 2>/dev/null || true
+          sha256sum "$RUNNER_TEMP/recruits-1.21.1-1.15.0-final.jar" \
+                    "$RUNNER_TEMP/workers-1.21.1-2.0.3-final.jar" \
+                    > "$OUT/jar-sha256.txt" 2>/dev/null || true
+          cat > "$OUT/manifest.json" <<JSON
+          {
+            "minecraft":"1.21.1",
+            "neoforge":"21.1.219",
+            "java":"21",
+            "recruits_commit":"$RECRUITS_SHA",
+            "workers_commit":"$WORKERS_SHA",
+            "clean_source_build":true,
+            "temporary_validation_classes":false,
+            "dedicated_server_ready":true,
+            "graceful_stop":true
+          }
+          JSON
+
+      - name: Upload clean final JARs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recruits-workers-final-production-jars
+          path: ${{ runner.temp }}/final-production-artifact
+          if-no-files-found: error
+          retention-days: 7
