@@ -33,6 +33,7 @@ public final class FinalRestartProbe {
     private static final UUID OWNER = UUID.fromString("00000000-0000-0000-0000-000000000001");
     private static int ticks;
     private static boolean completed;
+    private static boolean writePrepared;
 
     private FinalRestartProbe() {
     }
@@ -41,6 +42,7 @@ public final class FinalRestartProbe {
     public static void onStarted(ServerStartedEvent event) {
         ticks = 0;
         completed = false;
+        writePrepared = false;
         LOGGER.info("WORKERS_FINAL_RESTART_PROCESS_STARTED phaseExists={}", Files.exists(PHASE));
     }
 
@@ -49,15 +51,21 @@ public final class FinalRestartProbe {
         if (completed || ++ticks < 40) {
             return;
         }
-        completed = true;
         MinecraftServer server = event.getServer();
         try {
             if (Files.exists(PHASE)) {
+                completed = true;
                 verify(server);
+            } else if (!writePrepared) {
+                prepareWrite(server);
+                writePrepared = true;
+                ticks = 0;
             } else {
-                write(server);
+                completed = true;
+                finishWrite(server);
             }
         } catch (Throwable failure) {
+            completed = true;
             LOGGER.error("WORKERS_FINAL_RESTART_FAILED", failure);
             try {
                 Files.writeString(Path.of("workers-final-restart.fail"), failure.toString(),
@@ -68,7 +76,7 @@ public final class FinalRestartProbe {
         }
     }
 
-    private static void write(MinecraftServer server) throws Exception {
+    private static void prepareWrite(MinecraftServer server) {
         ServerLevel level = server.overworld();
         level.getChunkAt(CHEST_POS);
         level.setBlockAndUpdate(CHEST_POS.below(), Blocks.STONE.defaultBlockState());
@@ -90,6 +98,27 @@ public final class FinalRestartProbe {
         require(level.addFreshEntity(storage), "StorageArea could not be added");
         storage.scanStorageBlocks();
         verifyBridge(storage);
+        LOGGER.info("WORKERS_FINAL_RESTART_WRITE_PREPARED uuid={} storageTypes={} slots={} wheat0={} wheat1={}",
+                storage.getUUID(), storage.getStorageMask(storage.getStorageTypes()),
+                storage.getContainerSize(), storage.getItem(0).getCount(), storage.getItem(1).getCount());
+    }
+
+    private static void finishWrite(MinecraftServer server) throws Exception {
+        ServerLevel level = server.overworld();
+        level.getChunkAt(CHEST_POS);
+        ChestBlockEntity chest = requireChest(level);
+        require(chest.getItem(0).is(Items.WHEAT) && chest.getItem(0).getCount() == 64,
+                "Prepared chest slot 0 changed before save");
+        require(chest.getItem(1).is(Items.WHEAT) && chest.getItem(1).getCount() == 6,
+                "Prepared chest slot 1 changed before save");
+
+        List<StorageArea> storages = findStorages(level);
+        require(storages.size() == 1, "Expected one registered StorageArea before save, found " + storages.size());
+        StorageArea storage = storages.getFirst();
+        storage.scanStorageBlocks();
+        verifyBridge(storage);
+        require(storage.getStorageMask(storage.getStorageTypes()) == 8,
+                "Storage permission mask changed before save");
 
         require(server.saveEverything(true, true, true), "saveEverything returned false");
         Files.writeString(PHASE, "write-ok\n", StandardOpenOption.CREATE,
@@ -109,8 +138,7 @@ public final class FinalRestartProbe {
         require(chest.getItem(1).is(Items.WHEAT) && chest.getItem(1).getCount() == 6,
                 "Chest slot 1 did not persist 6 wheat");
 
-        List<StorageArea> storages = level.getEntitiesOfClass(StorageArea.class,
-                new AABB(CHEST_POS).inflate(4.0D));
+        List<StorageArea> storages = findStorages(level);
         require(storages.size() == 1, "Expected exactly one persisted StorageArea, found " + storages.size());
         StorageArea storage = storages.getFirst();
         require(OWNER.equals(storage.getPlayerUUID()), "Owner UUID did not persist");
@@ -128,6 +156,10 @@ public final class FinalRestartProbe {
                 storage.getUUID(), storage.getStorageMask(storage.getStorageTypes()),
                 storage.getContainerSize(), storage.getItem(0).getCount(), storage.getItem(1).getCount());
         server.halt(false);
+    }
+
+    private static List<StorageArea> findStorages(ServerLevel level) {
+        return level.getEntitiesOfClass(StorageArea.class, new AABB(CHEST_POS).inflate(4.0D));
     }
 
     private static ChestBlockEntity requireChest(ServerLevel level) {
