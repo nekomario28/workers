@@ -1,0 +1,114 @@
+name: Temporary Latest Recruits Workers Client Smoke
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  client-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      RECRUITS_SHA: 1848e8ec33376f8a933945d4704b3e4c49920d8e
+      WORKERS_SHA: 3859ceae9aa34464c3564597009608403a9fe8ea
+      LIBGL_ALWAYS_SOFTWARE: '1'
+      MESA_GL_VERSION_OVERRIDE: '4.5'
+      ALSOFT_DRIVERS: 'null'
+
+    steps:
+      - name: Check out client smoke harness
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Install headless client libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y xvfb libgl1-mesa-dri libglx-mesa0 mesa-utils libasound2t64
+          glxinfo -B || true
+
+      - name: Build exact latest Recruits
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/latest-client"
+          mkdir -p "$ROOT"
+          git clone https://github.com/nekomario28/recruits.git "$ROOT/recruits-neoforge-1.21.1"
+          cd "$ROOT/recruits-neoforge-1.21.1"
+          git checkout --detach "$RECRUITS_SHA"
+          test "$(git rev-parse HEAD)" = "$RECRUITS_SHA"
+          chmod +x gradlew
+          ./gradlew --no-daemon clean shadowJar --stacktrace 2>&1 | tee "$RUNNER_TEMP/client-recruits-build.log"
+          find build/libs -maxdepth 1 -name '*-all.jar' -print -quit | grep -q .
+
+      - name: Launch exact latest client under Xvfb
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/latest-client"
+          WORKERS="$ROOT/workers-neoforge-1.21.1"
+          git clone https://github.com/nekomario28/workers.git "$WORKERS"
+          cd "$WORKERS"
+          git checkout --detach "$WORKERS_SHA"
+          test "$(git rev-parse HEAD)" = "$WORKERS_SHA"
+          chmod +x gradlew
+          mkdir -p src/main/java/com/talhanation/workers/client/finaltest
+          cp "$GITHUB_WORKSPACE/.github/temporary-client/LatestClientSmokeProbe.java" \
+            src/main/java/com/talhanation/workers/client/finaltest/LatestClientSmokeProbe.java
+          git diff --check
+          timeout 360s xvfb-run -a -s '-screen 0 1280x720x24' \
+            ./gradlew --no-daemon runClient --stacktrace --info 2>&1 \
+            | tee "$RUNNER_TEMP/latest-client-smoke.log"
+          test "${PIPESTATUS[0]}" -eq 0
+          PASS="$(find . -name latest-client-smoke.pass -print -quit)"
+          FAIL="$(find . -name latest-client-smoke.fail -print -quit)"
+          test -n "$PASS"
+          test -z "$FAIL"
+          cat "$PASS" | tee "$RUNNER_TEMP/latest-client-smoke.pass"
+          grep -F 'LATEST_CLIENT_SMOKE_OK' "$RUNNER_TEMP/latest-client-smoke.log"
+          grep -F 'clientVillagerEvents=true' "$PASS"
+          grep -F 'workAreaScreenFactory=true' "$PASS"
+
+      - name: Collect client evidence
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          OUT="$RUNNER_TEMP/latest-client-evidence"
+          mkdir -p "$OUT"
+          cp "$RUNNER_TEMP"/*.log "$OUT"/ 2>/dev/null || true
+          cp "$RUNNER_TEMP/latest-client-smoke.pass" "$OUT"/ 2>/dev/null || true
+          ROOT="$RUNNER_TEMP/latest-client/workers-neoforge-1.21.1"
+          test ! -d "$ROOT/run/logs" || cp -a "$ROOT/run/logs" "$OUT/game-logs"
+          test ! -d "$ROOT/run/crash-reports" || cp -a "$ROOT/run/crash-reports" "$OUT/crash-reports"
+          cat > "$OUT/manifest.json" <<JSON
+          {
+            "minecraft":"1.21.1",
+            "neoforge":"21.1.219",
+            "java":"21",
+            "display":"Xvfb 1280x720x24",
+            "recruits_commit":"$RECRUITS_SHA",
+            "workers_commit":"$WORKERS_SHA",
+            "checks":{"client_boot":true,"screen_reached":true,"client_villager_events_loaded":true,"work_area_screen_factory_loaded":true}
+          }
+          JSON
+
+      - name: Upload client evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: latest-recruits-workers-client-smoke
+          path: ${{ runner.temp }}/latest-client-evidence
+          if-no-files-found: error
+          retention-days: 3
