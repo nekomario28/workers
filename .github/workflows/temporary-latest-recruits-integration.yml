@@ -1,0 +1,207 @@
+name: Temporary Latest Recruits Workers Integration
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      RECRUITS_SHA: 1848e8ec33376f8a933945d4704b3e4c49920d8e
+      WORKERS_SHA: 3859ceae9aa34464c3564597009608403a9fe8ea
+
+    steps:
+      - name: Check out integration harness
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Build exact latest Recruits
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/latest-integration"
+          mkdir -p "$ROOT"
+          git clone https://github.com/nekomario28/recruits.git "$ROOT/recruits-neoforge-1.21.1"
+          cd "$ROOT/recruits-neoforge-1.21.1"
+          git checkout --detach "$RECRUITS_SHA"
+          test "$(git rev-parse HEAD)" = "$RECRUITS_SHA"
+          chmod +x gradlew
+          ./gradlew --no-daemon clean shadowJar --stacktrace 2>&1 | tee "$RUNNER_TEMP/latest-recruits-build.log"
+          JAR="$(find build/libs -maxdepth 1 -name '*-all.jar' -print -quit)"
+          test -n "$JAR"
+          cp "$JAR" "$RUNNER_TEMP/latest-recruits.jar"
+
+      - name: Run cross-mod GameTests
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/latest-integration"
+          WORKERS="$ROOT/workers-neoforge-1.21.1"
+          git clone https://github.com/nekomario28/workers.git "$WORKERS"
+          cd "$WORKERS"
+          git checkout --detach "$WORKERS_SHA"
+          test "$(git rev-parse HEAD)" = "$WORKERS_SHA"
+          chmod +x gradlew
+          mkdir -p src/main/java/com/talhanation/workers/gametest
+          cp "$GITHUB_WORKSPACE/.github/temporary-integration/LatestRecruitsWorkersGameTests.java" \
+            src/main/java/com/talhanation/workers/gametest/LatestRecruitsWorkersGameTests.java
+          cat >> build.gradle <<'GRADLE'
+
+          neoForge {
+              runs {
+                  gameTestServer {
+                      type = "gameTestServer"
+                      gameDirectory = project.file('run-latest-integration-gametest')
+                      systemProperty 'neoforge.enabledGameTestNamespaces', 'workers,minecraft'
+                  }
+              }
+          }
+          GRADLE
+          mkdir -p src/main/resources/data/minecraft/structure
+          python3 - <<'PY'
+          from pathlib import Path
+          import gzip, struct
+          def u16(v): return struct.pack('>H', v)
+          def i32(v): return struct.pack('>i', v)
+          def name(v):
+              b=v.encode(); return u16(len(b))+b
+          def tint(k,v): return b'\x03'+name(k)+i32(v)
+          def tstr(k,v):
+              b=v.encode(); return b'\x08'+name(k)+u16(len(b))+b
+          def tli(k,vs): return b'\x09'+name(k)+b'\x03'+i32(len(vs))+b''.join(i32(v) for v in vs)
+          def comp(tags): return b''.join(tags)+b'\x00'
+          def tlc(k,vs): return b'\x09'+name(k)+b'\x0a'+i32(len(vs))+b''.join(vs)
+          root=b'\x0a'+name('')+comp([
+              tint('DataVersion',3955),tli('size',[7,3,7]),
+              tlc('palette',[comp([tstr('Name','minecraft:stone')])]),
+              tlc('blocks',[comp([tli('pos',[0,0,0]),tint('state',0)])]),
+              tlc('entities',[])])
+          Path('src/main/resources/data/minecraft/structure/empty.nbt').write_bytes(gzip.compress(root,mtime=0))
+          PY
+          ./gradlew --no-daemon clean runGameTestServer --stacktrace --info 2>&1 \
+            | tee "$RUNNER_TEMP/latest-integration-gametest.log"
+          grep -F 'All 4 required tests passed' "$RUNNER_TEMP/latest-integration-gametest.log"
+
+      - name: Build exact Workers integration-probe JAR
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/latest-integration"
+          WORKERS="$ROOT/workers-dedicated"
+          git clone https://github.com/nekomario28/workers.git "$WORKERS"
+          cd "$WORKERS"
+          git checkout --detach "$WORKERS_SHA"
+          test "$(git rev-parse HEAD)" = "$WORKERS_SHA"
+          chmod +x gradlew
+          mkdir -p src/main/java/com/talhanation/workers/finaltest
+          cp "$GITHUB_WORKSPACE/.github/temporary-integration/LatestRecruitsWorkersProbe.java" \
+            src/main/java/com/talhanation/workers/finaltest/LatestRecruitsWorkersProbe.java
+          ./gradlew --no-daemon clean shadowJar --stacktrace 2>&1 \
+            | tee "$RUNNER_TEMP/latest-workers-build.log"
+          JAR="$(find build/libs -maxdepth 1 -name '*-all.jar' -print -quit)"
+          test -n "$JAR"
+          cp "$JAR" "$RUNNER_TEMP/latest-workers.jar"
+
+      - name: Audit exact integration JARs
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            unzip -t "$RUNNER_TEMP/latest-recruits.jar" >/dev/null
+            unzip -t "$RUNNER_TEMP/latest-workers.jar" >/dev/null
+            python3 - "$RUNNER_TEMP/latest-recruits.jar" "$RUNNER_TEMP/latest-workers.jar" <<'PY'
+          import sys, zipfile
+          from collections import Counter
+          for jar in sys.argv[1:]:
+              with zipfile.ZipFile(jar) as z:
+                  counts=Counter(z.namelist())
+              dup=[n for n,c in counts.items() if c>1]
+              print(f'{jar}: duplicate_entries={len(dup)}')
+              if dup: raise SystemExit('\n'.join(dup[:50]))
+          PY
+            echo 'integration_jar_audit=PASS'
+          } 2>&1 | tee "$RUNNER_TEMP/latest-integration-jar-audit.txt"
+
+      - name: Install NeoForge dedicated server
+        shell: bash
+        run: |
+          set -euo pipefail
+          SERVER="$RUNNER_TEMP/latest-integration-server"
+          mkdir -p "$SERVER"
+          cd "$SERVER"
+          curl --fail --location --retry 3 --output neoforge-installer.jar \
+            https://maven.neoforged.net/releases/net/neoforged/neoforge/21.1.219/neoforge-21.1.219-installer.jar
+          java -jar neoforge-installer.jar --installServer 2>&1 | tee "$RUNNER_TEMP/latest-integration-server-install.log"
+          rm neoforge-installer.jar
+          mkdir -p mods
+          cp "$RUNNER_TEMP/latest-recruits.jar" mods/recruits-latest.jar
+          cp "$RUNNER_TEMP/latest-workers.jar" mods/workers-exact.jar
+          printf 'eula=true\n' > eula.txt
+          cat > server.properties <<'PROPERTIES'
+          online-mode=false
+          allow-flight=true
+          level-name=latest-recruits-workers-world
+          max-tick-time=120000
+          view-distance=5
+          simulation-distance=5
+          spawn-protection=0
+          PROPERTIES
+
+      - name: Run exact cross-mod dedicated server
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/latest-integration-server"
+          timeout 240s bash run.sh nogui 2>&1 | tee "$RUNNER_TEMP/latest-integration-dedicated.log"
+          test "${PIPESTATUS[0]}" -eq 0
+          test -f latest-recruits-workers.pass
+          test ! -f latest-recruits-workers.fail
+          grep -F 'LATEST_RECRUITS_WORKERS_INTEGRATION_OK' "$RUNNER_TEMP/latest-integration-dedicated.log"
+          grep -F 'recruits=1848e8ec33376f8a933945d4704b3e4c49920d8e' latest-recruits-workers.pass
+          grep -F 'workers=3859ceae9aa34464c3564597009608403a9fe8ea' latest-recruits-workers.pass
+          grep -F 'entities=5' latest-recruits-workers.pass
+          grep -F 'courierWorkerApi=true' latest-recruits-workers.pass
+
+      - name: Collect integration evidence
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          OUT="$RUNNER_TEMP/latest-integration-evidence"
+          mkdir -p "$OUT"
+          cp "$RUNNER_TEMP"/*.log "$OUT"/ 2>/dev/null || true
+          cp "$RUNNER_TEMP/latest-integration-server"/latest-recruits-workers.* "$OUT"/ 2>/dev/null || true
+          sha256sum "$RUNNER_TEMP/latest-recruits.jar" "$RUNNER_TEMP/latest-workers.jar" > "$OUT/jar-sha256.txt" 2>/dev/null || true
+          cat > "$OUT/manifest.json" <<JSON
+          {
+            "minecraft":"1.21.1",
+            "neoforge":"21.1.219",
+            "java":"21",
+            "recruits_commit":"$RECRUITS_SHA",
+            "workers_commit":"$WORKERS_SHA",
+            "gametests_expected":4,
+            "dedicated_server_processes":1,
+            "checks":{"mods_load":true,"entity_instantiation":true,"storage_container":true,"worker_api_server_safe":true}
+          }
+          JSON
+
+      - name: Upload integration evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: latest-recruits-workers-integration
+          path: ${{ runner.temp }}/latest-integration-evidence
+          if-no-files-found: error
+          retention-days: 3
