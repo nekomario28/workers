@@ -1,0 +1,153 @@
+name: Temporary Workers Recruits 1.15.2 API Repair
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      STABLE_BRANCH: port/neoforge-1.21.1
+      EXPECTED_STABLE_SHA: 3859ceae9aa34464c3564597009608403a9fe8ea
+      HARNESS_BRANCH: test/recruits-1152-workers-integration
+      OLD_WORKERS_SHA: 3859ceae9aa34464c3564597009608403a9fe8ea
+
+    steps:
+      - name: Repair Workers courier route API usage
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/workers-recruits-1152-api-repair"
+          STABLE="$ROOT/stable"
+          EVIDENCE="$ROOT/evidence"
+          mkdir -p "$EVIDENCE"
+
+          git clone --branch "$STABLE_BRANCH" \
+            "https://x-access-token:${GH_TOKEN}@github.com/nekomario28/workers.git" "$STABLE"
+          cd "$STABLE"
+          CURRENT_SHA="$(git rev-parse HEAD)"
+
+          python3 - "$CURRENT_SHA" "$EXPECTED_STABLE_SHA" <<'PY'
+          from pathlib import Path
+          import sys
+
+          current, expected = sys.argv[1:]
+          path = Path('src/main/java/com/talhanation/workers/client/gui/CourierScreen.java')
+          text = path.read_text()
+
+          old_import = 'import com.talhanation.recruits.client.gui.worldmap.WorldMapScreen;\n'
+          new_import = 'import com.talhanation.recruits.client.ClientManager;\n' + old_import
+          old_block = '''    public static File getRoutesDirectory() {
+                  return RecruitsRoute.getRoutesDirectory();
+              }
+              private void loadAvailableRoutes() {
+                  availableRoutes.clear();
+                  try {
+                      availableRoutes.addAll(RecruitsRoute.loadAllRoutes(getRoutesDirectory()));
+                      availableRoutes.sort((a, b) -> a.getName().compareToIgnoreCase(b.getName()));
+                  } catch (IOException e) {
+                      WorkersMain.LOGGER.warn("Could not load courier routes: {}", e.getMessage());
+                  }
+              }
+          '''
+          old_block = '\n'.join(line[4:] if line.startswith('    ') else line for line in old_block.splitlines()) + '\n'
+          new_block = '''    private void loadAvailableRoutes() {
+              availableRoutes.clear();
+              ClientManager.loadRoutes();
+              availableRoutes.addAll(ClientManager.getRoutesList());
+              availableRoutes.sort((a, b) -> a.getName().compareToIgnoreCase(b.getName()));
+          }
+          '''
+          new_block = '\n'.join(line[4:] if line.startswith('    ') else line for line in new_block.splitlines()) + '\n'
+
+          already_fixed = (
+              'ClientManager.loadRoutes();' in text
+              and 'ClientManager.getRoutesList()' in text
+              and 'RecruitsRoute.getRoutesDirectory()' not in text
+          )
+          if current != expected:
+              if not already_fixed:
+                  raise SystemExit(f'unexpected stable head {current}; compatibility repair not present')
+              raise SystemExit(0)
+
+          if text.count(old_import) != 1:
+              raise SystemExit(f'expected one WorldMapScreen import, found {text.count(old_import)}')
+          if text.count(old_block) != 1:
+              raise SystemExit(f'expected one legacy route-loading block, found {text.count(old_block)}')
+
+          text = text.replace(old_import, new_import, 1)
+          text = text.replace('import java.io.File;\n', '', 1)
+          text = text.replace('import java.io.IOException;\n', '', 1)
+          text = text.replace(old_block, new_block, 1)
+          path.write_text(text)
+          PY
+
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git diff --check
+          grep -F 'ClientManager.loadRoutes();' src/main/java/com/talhanation/workers/client/gui/CourierScreen.java
+          grep -F 'ClientManager.getRoutesList()' src/main/java/com/talhanation/workers/client/gui/CourierScreen.java
+          ! grep -F 'RecruitsRoute.getRoutesDirectory()' src/main/java/com/talhanation/workers/client/gui/CourierScreen.java
+
+          if ! git diff --quiet; then
+            git add src/main/java/com/talhanation/workers/client/gui/CourierScreen.java
+            git commit -m 'Adapt courier routes to Recruits client API'
+            git push origin "HEAD:$STABLE_BRANCH"
+          fi
+
+          NEW_WORKERS_SHA="$(git rev-parse HEAD)"
+          printf '%s\n' "$NEW_WORKERS_SHA" | tee "$EVIDENCE/workers-head.txt"
+          git diff --stat HEAD^ HEAD > "$EVIDENCE/workers-change-stat.txt" 2>/dev/null || true
+
+          HARNESS="$ROOT/harness"
+          git clone --branch "$HARNESS_BRANCH" \
+            "https://x-access-token:${GH_TOKEN}@github.com/nekomario28/workers.git" "$HARNESS"
+          cd "$HARNESS"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+
+          python3 - "$OLD_WORKERS_SHA" "$NEW_WORKERS_SHA" <<'PY'
+          from pathlib import Path
+          import sys
+          old, new = sys.argv[1:]
+          path = Path('.github/workflows/temporary-recruits-1152-workers-integration.yml')
+          text = path.read_text()
+          old_line = f'      WORKERS_SHA: {old}'
+          new_line = f'      WORKERS_SHA: {new}'
+          if old_line in text:
+              text = text.replace(old_line, new_line, 1)
+              path.write_text(text)
+          elif new_line not in text:
+              raise SystemExit('integration workflow contains neither expected old nor new Workers SHA')
+          PY
+
+          git diff --check
+          if ! git diff --quiet; then
+            git add .github/workflows/temporary-recruits-1152-workers-integration.yml
+            git commit -m 'Retest Recruits 1.15.2 with compatible Workers'
+            git push origin "HEAD:$HARNESS_BRANCH"
+          fi
+
+          cat > "$EVIDENCE/manifest.txt" <<EOF
+          stable_branch=$STABLE_BRANCH
+          workers_sha=$NEW_WORKERS_SHA
+          recruits_sha=ecfe4b59167bb72460ce7b015ff6391eb39d0463
+          compatibility_api=ClientManager.loadRoutes+getRoutesList
+          EOF
+
+      - name: Upload repair evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: workers-recruits-1152-api-repair
+          path: ${{ runner.temp }}/workers-recruits-1152-api-repair/evidence
+          if-no-files-found: error
+          retention-days: 7
