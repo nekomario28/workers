@@ -30,22 +30,22 @@ jobs:
           from pathlib import Path
           p = Path('src/main/java/com/talhanation/workers/client/gui/CourierScreen.java')
           s = p.read_text()
-          old = '''private void loadAvailableRoutes() {
-          availableRoutes.clear();
-          ClientManager.loadRoutes();
-          availableRoutes.addAll(ClientManager.getRoutesList());
-          availableRoutes.sort((a, b) -> a.getName().compareToIgnoreCase(b.getName()));
-          }
-          '''
-          old = '\n'.join(line[10:] if line.startswith('          ') else line for line in old.splitlines()) + '\n'
-          new = '''    private void loadAvailableRoutes() {
-              availableRoutes.clear();
-              ClientManager.loadRoutes();
-              availableRoutes.addAll(ClientManager.getRoutesList());
-              availableRoutes.sort((a, b) -> a.getName().compareToIgnoreCase(b.getName()));
-          }
-          '''
-          new = '\n'.join(line[4:] if line.startswith('    ') else line for line in new.splitlines()) + '\n'
+          old = (
+              "private void loadAvailableRoutes() {\n"
+              "availableRoutes.clear();\n"
+              "ClientManager.loadRoutes();\n"
+              "availableRoutes.addAll(ClientManager.getRoutesList());\n"
+              "availableRoutes.sort((a, b) -> a.getName().compareToIgnoreCase(b.getName()));\n"
+              "}\n"
+          )
+          new = (
+              "    private void loadAvailableRoutes() {\n"
+              "        availableRoutes.clear();\n"
+              "        ClientManager.loadRoutes();\n"
+              "        availableRoutes.addAll(ClientManager.getRoutesList());\n"
+              "        availableRoutes.sort((a, b) -> a.getName().compareToIgnoreCase(b.getName()));\n"
+              "    }\n"
+          )
           if s.count(old) != 1:
               raise SystemExit(f'expected one unformatted method, found {s.count(old)}')
           p.write_text(s.replace(old, new, 1))
