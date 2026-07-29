@@ -43,31 +43,6 @@ jobs:
           path = Path('src/main/java/com/talhanation/workers/client/gui/CourierScreen.java')
           text = path.read_text()
 
-          old_import = 'import com.talhanation.recruits.client.gui.worldmap.WorldMapScreen;\n'
-          new_import = 'import com.talhanation.recruits.client.ClientManager;\n' + old_import
-          old_block = '''    public static File getRoutesDirectory() {
-                  return RecruitsRoute.getRoutesDirectory();
-              }
-              private void loadAvailableRoutes() {
-                  availableRoutes.clear();
-                  try {
-                      availableRoutes.addAll(RecruitsRoute.loadAllRoutes(getRoutesDirectory()));
-                      availableRoutes.sort((a, b) -> a.getName().compareToIgnoreCase(b.getName()));
-                  } catch (IOException e) {
-                      WorkersMain.LOGGER.warn("Could not load courier routes: {}", e.getMessage());
-                  }
-              }
-          '''
-          old_block = '\n'.join(line[4:] if line.startswith('    ') else line for line in old_block.splitlines()) + '\n'
-          new_block = '''    private void loadAvailableRoutes() {
-              availableRoutes.clear();
-              ClientManager.loadRoutes();
-              availableRoutes.addAll(ClientManager.getRoutesList());
-              availableRoutes.sort((a, b) -> a.getName().compareToIgnoreCase(b.getName()));
-          }
-          '''
-          new_block = '\n'.join(line[4:] if line.startswith('    ') else line for line in new_block.splitlines()) + '\n'
-
           already_fixed = (
               'ClientManager.loadRoutes();' in text
               and 'ClientManager.getRoutesList()' in text
@@ -78,15 +53,34 @@ jobs:
                   raise SystemExit(f'unexpected stable head {current}; compatibility repair not present')
               raise SystemExit(0)
 
+          old_import = 'import com.talhanation.recruits.client.gui.worldmap.WorldMapScreen;\n'
           if text.count(old_import) != 1:
               raise SystemExit(f'expected one WorldMapScreen import, found {text.count(old_import)}')
-          if text.count(old_block) != 1:
-              raise SystemExit(f'expected one legacy route-loading block, found {text.count(old_block)}')
+          text = text.replace(
+              old_import,
+              'import com.talhanation.recruits.client.ClientManager;\n' + old_import,
+              1,
+          )
 
-          text = text.replace(old_import, new_import, 1)
+          start_marker = '    public static File getRoutesDirectory() {'
+          end_marker = '    private void loadWorkingDataFromEntity() {'
+          start = text.find(start_marker)
+          end = text.find(end_marker, start)
+          if start < 0 or end < 0:
+              raise SystemExit(f'legacy route-loading range not found: start={start}, end={end}')
+
+          replacement = '''    private void loadAvailableRoutes() {
+              availableRoutes.clear();
+              ClientManager.loadRoutes();
+              availableRoutes.addAll(ClientManager.getRoutesList());
+              availableRoutes.sort((a, b) -> a.getName().compareToIgnoreCase(b.getName()));
+          }
+
+          '''
+          replacement = '\n'.join(line[4:] if line.startswith('    ') else line for line in replacement.splitlines()) + '\n'
+          text = text[:start] + replacement + text[end:]
           text = text.replace('import java.io.File;\n', '', 1)
           text = text.replace('import java.io.IOException;\n', '', 1)
-          text = text.replace(old_block, new_block, 1)
           path.write_text(text)
           PY
 
