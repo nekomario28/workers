@@ -63,28 +63,36 @@ EOF
           echo "new_commit=${new_commit}" >> "${GITHUB_STEP_SUMMARY}"
           echo "tree=${new_tree}" >> "${GITHUB_STEP_SUMMARY}"
 
-      - name: Remove obsolete branches
+      - name: Remove explicitly obsolete branches
         shell: bash
-        env:
-          TARGET_BRANCH: port/neoforge-1.21.1
-          BASE_BRANCH: main
         run: |
           set -euo pipefail
           git fetch origin '+refs/heads/*:refs/remotes/origin/*' --prune
 
-          mapfile -t branches < <(
-            git for-each-ref --format='%(refname:strip=3)' refs/remotes/origin \
-              | grep -v '^HEAD$' \
-              | sort -u
+          delete_with_lease() {
+            local branch="$1"
+            local remote_ref="refs/remotes/origin/${branch}"
+            if ! git show-ref --verify --quiet "${remote_ref}"; then
+              return 0
+            fi
+            local expected
+            expected="$(git rev-parse "${remote_ref}")"
+            git push origin --delete "${branch}" \
+              --force-with-lease="refs/heads/${branch}:${expected}"
+          }
+
+          obsolete_branches=(
+            agent/workers-neoforge-1.21.1-archive
+            test/dedicated-server-gametest
+            test/final-two-process-validation
+            test/latest-recruits-workers-integration
+            test/latest-client-smoke
+            test/final-production-build
+            test/recruits-1152-workers-integration
           )
 
-          for branch in "${branches[@]}"; do
-            case "${branch}" in
-              "${BASE_BRANCH}"|"${TARGET_BRANCH}"|"${GITHUB_REF_NAME}")
-                continue
-                ;;
-            esac
-            git push origin --delete "${branch}"
+          for branch in "${obsolete_branches[@]}"; do
+            delete_with_lease "${branch}"
           done
 
-          git push origin --delete "${GITHUB_REF_NAME}" || true
+          delete_with_lease "${GITHUB_REF_NAME}"
