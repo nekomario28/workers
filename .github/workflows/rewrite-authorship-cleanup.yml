@@ -1,6 +1,8 @@
 name: Rewrite authorship and clean branches
 
 on:
+  push:
+    branches: [chore/rewrite-authorship-cleanup-20260730]
   pull_request:
     types: [opened, synchronize, reopened]
 
@@ -9,7 +11,7 @@ permissions:
 
 jobs:
   rewrite-and-clean:
-    if: github.head_ref == 'chore/rewrite-authorship-cleanup-20260730'
+    if: github.ref == 'refs/heads/chore/rewrite-authorship-cleanup-20260730' || github.head_ref == 'chore/rewrite-authorship-cleanup-20260730'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -78,11 +80,11 @@ EOF
 
           for branch in "${branches[@]}"; do
             case "${branch}" in
-              "${BASE_BRANCH}"|"${TARGET_BRANCH}"|"${GITHUB_HEAD_REF}")
+              "${BASE_BRANCH}"|"${TARGET_BRANCH}"|"${GITHUB_REF_NAME}")
                 continue
                 ;;
             esac
             git push origin --delete "${branch}"
           done
 
-          git push origin --delete "${GITHUB_HEAD_REF}" || true
+          git push origin --delete "${GITHUB_REF_NAME}" || true
