@@ -1,0 +1,88 @@
+name: Rewrite authorship and clean branches
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+
+jobs:
+  rewrite-and-clean:
+    if: github.head_ref == 'chore/rewrite-authorship-cleanup-20260730'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Rebuild clean contribution branch
+        shell: bash
+        env:
+          TARGET_BRANCH: port/neoforge-1.21.1
+          BASE_BRANCH: main
+          CONTRIBUTOR_NAME: nekomario28
+          CONTRIBUTOR_EMAIL: 206304251+nekomario28@users.noreply.github.com
+        run: |
+          set -euo pipefail
+
+          git fetch origin '+refs/heads/*:refs/remotes/origin/*' --prune
+          old_commit="$(git rev-parse "origin/${TARGET_BRANCH}")"
+          base_commit="$(git rev-parse "origin/${BASE_BRANCH}")"
+          merge_base="$(git merge-base "${base_commit}" "${old_commit}")"
+
+          if [[ "${merge_base}" != "${base_commit}" ]]; then
+            echo "Target branch is not based directly on current main." >&2
+            exit 1
+          fi
+
+          old_tree="$(git rev-parse "${old_commit}^{tree}")"
+          export GIT_AUTHOR_NAME="${CONTRIBUTOR_NAME}"
+          export GIT_AUTHOR_EMAIL="${CONTRIBUTOR_EMAIL}"
+          export GIT_COMMITTER_NAME="${CONTRIBUTOR_NAME}"
+          export GIT_COMMITTER_EMAIL="${CONTRIBUTOR_EMAIL}"
+
+          new_commit="$(cat <<'EOF' | git commit-tree "${old_tree}" -p "${base_commit}"
+Port Villager Workers to NeoForge 1.21.1
+
+Migrate Villager Workers 2.0.3 from Forge to NeoForge for Minecraft 1.21.1, retain the existing gameplay behavior, and update Courier route loading for Recruits 1.15.2 compatibility.
+
+Validated with cross-mod GameTests, production JAR audits, a dedicated-server startup, entity creation checks, and an Xvfb client smoke test.
+EOF
+          )"
+
+          new_tree="$(git rev-parse "${new_commit}^{tree}")"
+          test "${new_tree}" = "${old_tree}"
+
+          git push origin "${new_commit}:refs/heads/${TARGET_BRANCH}" \
+            --force-with-lease="refs/heads/${TARGET_BRANCH}:${old_commit}"
+
+          echo "old_commit=${old_commit}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "new_commit=${new_commit}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "tree=${new_tree}" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Remove obsolete branches
+        shell: bash
+        env:
+          TARGET_BRANCH: port/neoforge-1.21.1
+          BASE_BRANCH: main
+        run: |
+          set -euo pipefail
+          git fetch origin '+refs/heads/*:refs/remotes/origin/*' --prune
+
+          mapfile -t branches < <(
+            git for-each-ref --format='%(refname:strip=3)' refs/remotes/origin \
+              | grep -v '^HEAD$' \
+              | sort -u
+          )
+
+          for branch in "${branches[@]}"; do
+            case "${branch}" in
+              "${BASE_BRANCH}"|"${TARGET_BRANCH}"|"${GITHUB_HEAD_REF}")
+                continue
+                ;;
+            esac
+            git push origin --delete "${branch}"
+          done
+
+          git push origin --delete "${GITHUB_HEAD_REF}" || true
