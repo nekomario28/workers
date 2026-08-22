@@ -7,61 +7,45 @@ on:
 permissions:
   contents: read
 
-# Temporary research workflow; never merge.
 jobs:
-  discover:
+  inspect:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Discover and fetch 2016 Economic Census municipal workbook
+      - name: Inspect official 2016 Economic Census table 1
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet 'beautifulsoup4==4.13.4' 'requests==2.32.5' 'openpyxl==3.1.5' 'xlrd==2.0.1'
+          python3 -m pip install --quiet 'xlrd==2.0.1' 'requests==2.32.5'
           mkdir -p out
           python3 - <<'PY'
-          import re, requests, pathlib
-          from bs4 import BeautifulSoup
-          from urllib.parse import urljoin
-          s=requests.Session(); s.headers['User-Agent']='Mozilla/5.0'
-          urls=[
-            'https://www.e-stat.go.jp/stat-search/database?statdisp_id=0003218500',
-            'https://www.e-stat.go.jp/stat-search/files?cycle=0&layout=datalist&month=12040606&tclass1=000001117769&tclass2=000001117775&toukei=00200553&tstat=000001095895&year=20160',
-            'https://www.e-stat.go.jp/index.php/stat-search/files?cycle=0&layout=datalist&month=12040606&tclass1=000001117769&tclass2=000001117775&toukei=00200553&tstat=000001095895&year=20160',
-          ]
-          found=[]
-          for j,u in enumerate(urls):
-            r=s.get(u,timeout=30); print('PAGE',j,r.status_code,len(r.content),r.url)
-            pathlib.Path(f'out/page{j}.html').write_bytes(r.content)
-            if r.status_code!=200: continue
-            soup=BeautifulSoup(r.text,'html.parser')
-            for a in soup.find_all('a',href=True):
-              h=urljoin(r.url,a['href']); t=' '.join(a.stripped_strings)
-              if 'statInfId=' in h or 'file-download' in h or 'EXCEL' in t.upper(): found.append((t,h))
-          seen=set(); found=[x for x in found if not (x[1] in seen or seen.add(x[1]))]
-          pathlib.Path('out/links.tsv').write_text('\n'.join(t+'\t'+u for t,u in found),encoding='utf-8')
-          print('LINKS',len(found))
-          for t,u in found: print('LINK',t[:120],u)
-          ids=[]
-          for t,u in found:
-            m=re.search(r'statInfId=(\d+)',u)
-            if m: ids.append(m.group(1))
-          print('STATINFIDS',sorted(set(ids)))
-          n=0
-          for t,u in found:
-            if 'file-download' not in u: continue
-            rr=s.get(u,timeout=60,allow_redirects=True); sig=rr.content[:8]
-            print('FETCH',rr.status_code,len(rr.content),sig,t[:80],u)
-            if rr.status_code==200 and len(rr.content)>10000 and (sig.startswith(b'PK') or sig.startswith(bytes.fromhex('D0CF11E0'))):
-              pathlib.Path(f'out/candidate_{n}.bin').write_bytes(rr.content); n+=1
-          print('EXCEL_CANDIDATES',n)
+          import csv, hashlib, re, requests, xlrd
+          from pathlib import Path
+          url='https://www.e-stat.go.jp/stat-search/file-download?statInfId=000031768938&fileKind=0'
+          r=requests.get(url,headers={'User-Agent':'Mozilla/5.0'},timeout=60); r.raise_for_status()
+          Path('out/table1.xls').write_bytes(r.content)
+          print('RAW',len(r.content),hashlib.sha256(r.content).hexdigest())
+          wb=xlrd.open_workbook(file_contents=r.content)
+          print('SHEETS',[(s.name,s.nrows,s.ncols) for s in wb.sheets()])
+          targets=['千代田区','中央区','港区','新宿区','文京区','台東区','墨田区','江東区','品川区','目黒区','大田区','世田谷区','渋谷区','中野区','杉並区','豊島区','北区','荒川区','板橋区','練馬区','足立区','葛飾区','江戸川区','福岡市東区','福岡市博多区','福岡市中央区','福岡市南区','福岡市西区','福岡市城南区','福岡市早良区']
+          with open('out/matches.tsv','w',encoding='utf-8',newline='') as f:
+            w=csv.writer(f,delimiter='\t'); w.writerow(['sheet','row','cells'])
+            for sh in wb.sheets():
+              for i in range(sh.nrows):
+                vals=[sh.cell_value(i,j) for j in range(sh.ncols)]
+                text=' | '.join(str(v) for v in vals)
+                if any(t in text for t in targets):
+                  compact=[]
+                  for j,v in enumerate(vals):
+                    if v not in ('',None): compact.append(f'{j}:{v}')
+                  w.writerow([sh.name,i,' || '.join(compact)])
+                  print('MATCH',sh.name,i,' || '.join(compact)[:3000])
           PY
-          sha256sum out/* || true
-          file out/* || true
-      - name: Upload discovery evidence
+          sha256sum out/*
+      - name: Upload inspection
         uses: actions/upload-artifact@v4
         with:
-          name: holdout-denominator-discovery
+          name: holdout-denominator-inspection
           path: out/
           if-no-files-found: error
           retention-days: 1
