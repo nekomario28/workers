@@ -1,4 +1,4 @@
-name: Diagnostic Holdout NTA 90d Freeze
+name: Diagnostic Holdout Demand Inspect
 
 on:
   pull_request:
@@ -8,108 +8,45 @@ permissions:
   contents: read
 
 jobs:
-  freeze:
+  inspect:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Freeze complete cur90 NTA Formation and terminal Exit
+      - name: Inspect cutoff-safe resident-registry workbooks
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p out src
-          sha='8d5276bec8a245d48abfaaa5c3358aa394194bea'
-          curl --fail --location --retry 3 --retry-all-errors \
-            "https://codeload.github.com/code4fukui/gBizINFO/tar.gz/${sha}" -o out/gBizINFO.tar.gz
-          tar -xzf out/gBizINFO.tar.gz -C src --strip-components=1
+          python3 -m pip install --quiet 'openpyxl==3.1.5' 'requests==2.32.5'
+          mkdir -p out
           python3 - <<'PY'
-          import csv,glob,re,hashlib,json
+          import requests,hashlib,re
           from pathlib import Path
-          source_sha='8d5276bec8a245d48abfaaa5c3358aa394194bea'
-          start='2022-01-01'; end='2022-03-31'
-          names={
-            '13101':'千代田区','13102':'中央区','13103':'港区','13104':'新宿区','13105':'文京区','13106':'台東区','13107':'墨田区','13108':'江東区','13109':'品川区','13110':'目黒区','13111':'大田区','13112':'世田谷区','13113':'渋谷区','13114':'中野区','13115':'杉並区','13116':'豊島区','13117':'北区','13118':'荒川区','13119':'板橋区','13120':'練馬区','13121':'足立区','13122':'葛飾区','13123':'江戸川区',
-            '40131':'東区','40132':'博多区','40133':'中央区','40134':'南区','40135':'西区','40136':'城南区','40137':'早良区'}
-          core_names={'株式会社','有限会社','合名会社','合資会社','合同会社'}; core_codes={'301','302','303','304','305'}
-          expected=set(names)
-          form={c:set() for c in expected}; exit={c:set() for c in expected}
-          diag={'created_files':0,'terminated_files':0,'created_rows':0,'terminated_rows':0,'target_region_rows_created':0,'target_region_rows_terminated':0,'core_created_rows':0,'core_terminated_rows':0,'terminal_exit_rows':0,'duplicate_formation_keys':0,'duplicate_exit_keys':0,'bad_dates':0,'closure_classes':{}}
-          def date_ok(s): return bool(re.fullmatch(r'\d{4}-\d{2}-\d{2}',s or ''))
-          def region(r):
-            p=str(r.get('prefectureCode','')).zfill(2); c=str(r.get('cityCode','')).zfill(3)
-            return p+c
-          def is_core(r):
-            k=str(r.get('kind','')).strip(); return k in core_names or k in core_codes
-          def process_is(v,code,name):
-            s=str(v or '').strip(); return s==code or s==name
-          def correct0(v): return str(v or '').strip() in ('0','0.0','')
-
-          created_files=[]; terminated_files=[]
-          for f in sorted(glob.glob('src/data/diff_*_created.csv')):
-            m=re.search(r'diff_(\d{8})_created\.csv$',f)
-            if not m: continue
-            d=f'{m.group(1)[:4]}-{m.group(1)[4:6]}-{m.group(1)[6:]}'
-            if start<=d<=end: created_files.append(f)
-          for f in sorted(glob.glob('src/data/diff_*_terminated.csv')):
-            m=re.search(r'diff_(\d{8})_terminated\.csv$',f)
-            if not m: continue
-            d=f'{m.group(1)[:4]}-{m.group(1)[4:6]}-{m.group(1)[6:]}'
-            if start<=d<=end: terminated_files.append(f)
-          assert len(created_files)==len(terminated_files)==59,(len(created_files),len(terminated_files))
-          diag['created_files']=len(created_files); diag['terminated_files']=len(terminated_files)
-
-          for f in created_files:
-            with open(f,encoding='utf-8-sig',newline='') as h:
-              for r in csv.DictReader(h):
-                diag['created_rows']+=1
-                ch=str(r.get('changeDate','')).strip()
-                if not date_ok(ch): diag['bad_dates']+=1; continue
-                if not (start<=ch<=end): continue
-                code=region(r)
-                if code not in expected: continue
-                diag['target_region_rows_created']+=1
-                if not correct0(r.get('correct')) or not process_is(r.get('process'),'01','新規') or not is_core(r): continue
-                diag['core_created_rows']+=1
-                key=(str(r.get('corporateNumber','')).strip(),ch)
-                before=len(form[code]); form[code].add(key)
-                if len(form[code])==before: diag['duplicate_formation_keys']+=1
-          for f in terminated_files:
-            with open(f,encoding='utf-8-sig',newline='') as h:
-              for r in csv.DictReader(h):
-                diag['terminated_rows']+=1
-                ch=str(r.get('changeDate','')).strip()
-                if not date_ok(ch): diag['bad_dates']+=1; continue
-                if not (start<=ch<=end): continue
-                code=region(r)
-                if code not in expected: continue
-                diag['target_region_rows_terminated']+=1
-                if not correct0(r.get('correct')) or not process_is(r.get('process'),'21','登記記録の閉鎖等') or not is_core(r): continue
-                diag['core_terminated_rows']+=1
-                cc=str(r.get('closeCause','')).strip(); diag['closure_classes'][cc]=diag['closure_classes'].get(cc,0)+1
-                if cc not in ('01','清算の結了等'): continue
-                diag['terminal_exit_rows']+=1
-                key=(str(r.get('corporateNumber','')).strip(),ch)
-                before=len(exit[code]); exit[code].add(key)
-                if len(exit[code])==before: diag['duplicate_exit_keys']+=1
-          assert diag['bad_dates']==0,diag
-
-          out='out/nta_cur90_30regions.csv'
-          with open(out,'w',encoding='utf-8',newline='') as f:
-            w=csv.writer(f); w.writerow(['region_code','region_name','metro','formation_90d','terminal_exit_90d','window_start','window_end','source_revision','coverage_status','formation_365_status','prev90_status','prev365_status'])
-            for c in sorted(expected):
-              w.writerow([c,names[c],'Tokyo' if c.startswith('13') else 'Fukuoka',len(form[c]),len(exit[c]),start,end,source_sha,'complete','BLOCKED_source_starts_2021-07-14','BLOCKED_source_starts_2021-07-14','BLOCKED_source_starts_2021-07-14'])
-          meta={'source_revision':source_sha,'window':{'start':start,'end':end},'coverage':'complete','unavailable':{'formation_365':'source begins 2021-07-14; full 2021-04-01..2022-03-31 unavailable','prev90':'2021-01-01..2021-03-31 unavailable','prev365':'2020-04-01..2021-03-31 unavailable'},'diagnostics':diag}
-          Path('out/nta_meta.json').write_text(json.dumps(meta,ensure_ascii=False,indent=2,sort_keys=True),encoding='utf-8')
-          print('GATE cur90 complete files=59x2 regions=30 bad_dates=0')
-          print('CSV_SHA',hashlib.sha256(Path(out).read_bytes()).hexdigest())
-          print('META_SHA',hashlib.sha256(Path('out/nta_meta.json').read_bytes()).hexdigest())
-          print('DIAG',json.dumps(diag,ensure_ascii=False,sort_keys=True))
+          import openpyxl
+          specs=[('2020_main','000031971203'),('2020_age','000031971230'),('2021_main','000040306659'),('2021_age','000040306661')]
+          for label,sid in specs:
+            u=f'https://www.e-stat.go.jp/stat-search/file-download?fileKind=0&statInfId={sid}'
+            r=requests.get(u,headers={'User-Agent':'Mozilla/5.0'},timeout=60); print('HTTP',label,r.status_code,len(r.content)); r.raise_for_status()
+            Path(f'out/{label}.xlsx').write_bytes(r.content)
+            print('SHA',label,hashlib.sha256(r.content).hexdigest(),r.content[:8])
+            wb=openpyxl.load_workbook(f'out/{label}.xlsx',data_only=True,read_only=True)
+            print('SHEETS',label,wb.sheetnames)
+            for ws in wb.worksheets:
+              print('SHEET',label,ws.title,ws.max_row,ws.max_column)
+              for row in ws.iter_rows(min_row=1,max_row=min(ws.max_row,18),values_only=True):
+                vals=[f'{i}:{v}' for i,v in enumerate(row) if v not in (None,'')]
+                if vals: print('HEAD', ' || '.join(vals)[:6000])
+              hit=0
+              for ri,row in enumerate(ws.iter_rows(values_only=True),start=1):
+                text=' | '.join(str(v) for v in row if v is not None)
+                if ('13101' in text or '40131' in text) and hit<8:
+                  vals=[f'{i}:{v}' for i,v in enumerate(row) if v not in (None,'')]
+                  print('TARGET',label,ws.title,ri,' || '.join(vals)[:7000]); hit+=1
           PY
           sha256sum out/*
-          rm -f out/gBizINFO.tar.gz
-      - name: Upload frozen NTA cur90
+      - name: Upload Demand inspection
         uses: actions/upload-artifact@v4
         with:
-          name: holdout-nta-cur90-freeze
+          name: holdout-demand-inspection
           path: out/
           if-no-files-found: error
           retention-days: 1
