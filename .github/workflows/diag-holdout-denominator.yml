@@ -26,44 +26,33 @@ jobs:
           names={
             '13101':'千代田区','13102':'中央区','13103':'港区','13104':'新宿区','13105':'文京区','13106':'台東区','13107':'墨田区','13108':'江東区','13109':'品川区','13110':'目黒区','13111':'大田区','13112':'世田谷区','13113':'渋谷区','13114':'中野区','13115':'杉並区','13116':'豊島区','13117':'北区','13118':'荒川区','13119':'板橋区','13120':'練馬区','13121':'足立区','13122':'葛飾区','13123':'江戸川区',
             '40131':'東区','40132':'博多区','40133':'中央区','40134':'南区','40135':'西区','40136':'城南区','40137':'早良区'}
-          cats={
-            'total':'全建築物計',
-            'J':'卸売業，小売業用建築物',
-            'L':'不動産業用建築物',
-            'M':'宿泊業，飲食サービス業用建築物',
-            'O':'医療，福祉用建築物',
-          }
-          expected=set(names)
-          parts=[]; source_meta={}
-
-          def norm(s):
-            return re.sub(r'[\s　]+','',str(s)).replace('・','・')
+          cats={'total':'全建築物計','J':'卸売業，小売業用建築物','L':'不動産業用建築物','M':'宿泊業，飲食サービス業用建築物','O':'医療，福祉用建築物'}
+          expected=set(names); parts=[]
+          def norm(s): return re.sub(r'[\s　]+','',str(s))
 
           for source_label,sid in sources:
             u=f'https://www.e-stat.go.jp/stat-search/file-download?fileKind=0&statInfId={sid}'
             r=requests.get(u,headers={'User-Agent':'Mozilla/5.0'},timeout=60); r.raise_for_status()
             b=r.content; raw_sha=hashlib.sha256(b).hexdigest(); Path(f'out/{source_label}.xls').write_bytes(b)
-            wb=xlrd.open_workbook(file_contents=b); sh=wb.sheet_by_name('B007')
+            sh=xlrd.open_workbook(file_contents=b).sheet_by_name('B007')
             h4=[norm(sh.cell_value(4,c)) for c in range(sh.ncols)]
             h5=[norm(sh.cell_value(5,c)) for c in range(sh.ncols)]
-            starts=[]
-            for key,label in cats.items():
-              needle=norm(label)
-              matches=[i for i,x in enumerate(h4) if needle in x]
-              assert len(matches)==1,(source_label,key,matches)
-              starts.append((matches[0],key))
-            starts=sorted(starts)
+            all_starts=[c for c,x in enumerate(h4) if x and c>=3]
             colmap={}
-            for pos,(start,key) in enumerate(starts):
-              end=starts[pos+1][0] if pos+1<len(starts) else sh.ncols
+            for key,label in cats.items():
+              matches=[c for c,x in enumerate(h4) if norm(label) in x]
+              assert len(matches)==1,(source_label,key,matches)
+              start=matches[0]
+              later=[c for c in all_starts if c>start]
+              end=min(later) if later else sh.ncols
               floor=[c for c in range(start,end) if '床面積の合計' in h5[c]]
-              assert len(floor)==1,(source_label,key,start,end,floor)
+              assert len(floor)==1,(source_label,key,start,end,floor,[h5[c] for c in range(start,end)])
               colmap[key]=floor[0]
             print('COLMAP',source_label,colmap)
+
             seen={}
             for row in range(sh.nrows):
-              first=str(sh.cell_value(row,1)).strip()
-              m=re.match(r'^(\d{5})',first)
+              first=str(sh.cell_value(row,1)).strip(); m=re.match(r'^(\d{5})',first)
               if not m: continue
               code=m.group(1)
               if code not in expected: continue
@@ -77,14 +66,11 @@ jobs:
               seen[code]=row
               parts.append((code,names[code],'Tokyo' if code.startswith('13') else 'Fukuoka',source_label,sid,raw_sha,row,vals['total'],vals['J'],vals['L'],vals['M'],vals['O']))
             assert set(seen)==expected,(source_label,len(seen),sorted(expected-set(seen)),sorted(set(seen)-expected))
-            source_meta[source_label]=(sid,raw_sha,colmap)
             print('GATE',source_label,'regions=30 unique=30 numeric=150 nonnegative=150')
 
           parts=sorted(parts,key=lambda x:(x[0],x[3]))
           with open('out/physical_h24_parts.csv','w',encoding='utf-8',newline='') as f:
-            w=csv.writer(f); w.writerow(['region_code','region_name','metro','source_part','stat_infid','raw_sha256','source_row','floor_area_total','floor_area_J','floor_area_L','floor_area_M','floor_area_O'])
-            w.writerows(parts)
-
+            w=csv.writer(f); w.writerow(['region_code','region_name','metro','source_part','stat_infid','raw_sha256','source_row','floor_area_total','floor_area_J','floor_area_L','floor_area_M','floor_area_O']); w.writerows(parts)
           by={c:{'name':names[c],'metro':'Tokyo' if c.startswith('13') else 'Fukuoka','total':0,'J':0,'L':0,'M':0,'O':0} for c in expected}
           for code,name,metro,src,sid,sha,row,total,J,L,M,O in parts:
             for k,v in [('total',total),('J',J),('L',L),('M',M),('O',O)]: by[code][k]+=v
@@ -92,8 +78,7 @@ jobs:
             w=csv.writer(f); w.writerow(['region_code','region_name','metro','floor_area_total_h24','floor_area_J_h24','floor_area_L_h24','floor_area_M_h24','floor_area_O_h24','h24_start','h24_end'])
             for code in sorted(by):
               x=by[code]; w.writerow([code,x['name'],x['metro'],x['total'],x['J'],x['L'],x['M'],x['O'],'2022-04-01','2024-03-31'])
-          for p in ['out/physical_h24_parts.csv','out/physical_h24.csv']:
-            print('SHA',Path(p).name,hashlib.sha256(Path(p).read_bytes()).hexdigest())
+          for p in ['out/physical_h24_parts.csv','out/physical_h24.csv']: print('SHA',Path(p).name,hashlib.sha256(Path(p).read_bytes()).hexdigest())
           print('FINAL_GATE parts=2x30 aggregate=30 duplicate=0 silent_zero_fill=0')
           PY
           sha256sum out/*
