@@ -1,0 +1,95 @@
+name: Diagnostic Transit Future Label
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Discover N02 annual snapshot downloads and inspect station schema
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet 'requests==2.32.5' 'pyshp==2.3.1'
+          mkdir -p out
+          python3 - <<'PY'
+          import hashlib, io, json, re, requests, zipfile
+          from pathlib import Path
+          import shapefile
+
+          UA={'User-Agent':'Mozilla/5.0'}
+          years=[2011,2015,2020,2025]
+          yy={2011:'11',2015:'15',2020:'20',2025:'25'}
+          s=requests.Session(); s.headers.update(UA)
+          summary=[]
+          for year in years:
+            code=yy[year]
+            page=f'https://nlftp.mlit.go.jp/ksj/gml/datalist/KsjTmplt-N02-{year}.html'
+            r=s.get(page,timeout=30); r.raise_for_status()
+            html=r.text
+            Path(f'out/page_{year}.html').write_text(html,encoding='utf-8')
+            fname=f'N02-{code}_GML.zip'
+            pos=html.find(fname)
+            print('PAGE',year,r.status_code,len(r.content),'FNAME_POS',pos)
+            if pos>=0: print('CONTEXT',year,repr(html[max(0,pos-1200):pos+1200]))
+            candidates=[]
+            # URLs or relative paths embedded in page source.
+            for m in re.finditer(r'''(?:https?://[^\"'<> ]+|/[^\"'<> ]+)''',html):
+              u=m.group(0).replace('&amp;','&')
+              if fname in u: candidates.append(requests.compat.urljoin(page,u))
+            # Stable KSJ path patterns used by the service.
+            candidates += [
+              f'https://nlftp.mlit.go.jp/ksj/gml/data/N02/N02-{code}/{fname}',
+              f'https://nlftp.mlit.go.jp/ksj/gml/data/N02/N02-{code}/N02-{code}_SHP.zip',
+              f'https://nlftp.mlit.go.jp/ksj/gml/data/N02/N02-{code}/N02-{code}_GEOJSON.zip',
+            ]
+            seen=[]
+            for u in candidates:
+              if u not in seen: seen.append(u)
+            chosen=None; blob=None
+            for u in seen:
+              try:
+                rr=s.get(u,timeout=60,allow_redirects=True)
+                print('PROBE',year,rr.status_code,len(rr.content),rr.url,u)
+                if rr.status_code==200 and rr.content[:2]==b'PK': chosen=rr.url; blob=rr.content; break
+              except Exception as e:
+                print('PROBE_ERR',year,u,repr(e))
+            if blob is None:
+              raise SystemExit(f'no downloadable N02 zip resolved for {year}')
+            zsha=hashlib.sha256(blob).hexdigest()
+            Path(f'out/N02-{code}.zip').write_bytes(blob)
+            z=zipfile.ZipFile(io.BytesIO(blob))
+            names=z.namelist()
+            print('ZIP',year,zsha,len(names),names[:30])
+            # Prefer Station shapefile if present; otherwise record available files.
+            shp=[n for n in names if n.lower().endswith('.shp') and 'station' in n.lower()]
+            if not shp: shp=[n for n in names if n.lower().endswith('.shp')]
+            station_count=None; fields=[]; samples=[]
+            if shp:
+              base=shp[0][:-4]
+              need={ext:next((n for n in names if n.lower()==(base+ext).lower()),None) for ext in ['.shp','.shx','.dbf']}
+              if all(need.values()):
+                rdr=shapefile.Reader(shp=io.BytesIO(z.read(need['.shp'])),shx=io.BytesIO(z.read(need['.shx'])),dbf=io.BytesIO(z.read(need['.dbf'])))
+                fields=[f[0] for f in rdr.fields[1:]]
+                station_count=len(rdr)
+                for sr in rdr.iterShapeRecords():
+                  rec=dict(zip(fields,sr.record))
+                  if len(samples)<5: samples.append(rec)
+                print('STATIONS',year,station_count,'FIELDS',fields,'SAMPLES',json.dumps(samples,ensure_ascii=False)[:10000])
+            summary.append({'year':year,'url':chosen,'zip_sha256':zsha,'station_shp':shp[0] if shp else None,'station_count':station_count,'fields':fields,'samples':samples})
+          Path('out/summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+          sha256sum out/* || true
+      - name: Upload transit label discovery evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: transit-future-label-discovery
+          path: out/
+          if-no-files-found: error
+          retention-days: 1
