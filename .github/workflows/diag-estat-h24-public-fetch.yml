@@ -1,9 +1,6 @@
 name: Diagnostic e-Stat H24 Public Fetch
 
 on:
-  push:
-    branches:
-      - diag/estat-h24-public-fetch
   pull_request:
     branches:
       - main
@@ -12,41 +9,20 @@ permissions:
   contents: read
 
 jobs:
-  fetch:
+  probe:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Fetch official e-Stat annual/fiscal workbooks and CSV probes
+      - name: Probe e-Stat fileKind variants without parsing
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p raw
-          for spec in \
-            A:000040273624 \
-            B:000040273625 \
-            C:000040451288
-          do
-            part="${spec%%:*}"
-            id="${spec#*:}"
-            curl --fail --location --retry 3 --retry-all-errors \
-              "https://www.e-stat.go.jp/stat-search/file-download?fileKind=0&statInfId=${id}" \
-              -o "raw/${part}_${id}.xls"
-            if curl --fail --location --retry 1 --retry-all-errors \
-              "https://www.e-stat.go.jp/stat-search/file-download?fileKind=1&statInfId=${id}" \
-              -o "raw/${part}_${id}_fileKind1"; then
-              test -s "raw/${part}_${id}_fileKind1"
-            else
-              rm -f "raw/${part}_${id}_fileKind1"
-              printf 'NO_FILEKIND1 part=%s statInfId=%s\n' "$part" "$id"
-            fi
+          mkdir -p probe
+          id=000040273625
+          for kind in 0 1 2 3 4 5 6 7 8 9 10; do
+            out="probe/k${kind}"
+            code="$(curl -sS -L -o "$out" -w '%{http_code}' "https://www.e-stat.go.jp/stat-search/file-download?fileKind=${kind}&statInfId=${id}" || true)"
+            ctype="$(file -b "$out" 2>/dev/null || true)"
+            size="$(wc -c < "$out" 2>/dev/null || printf 0)"
+            printf 'FILEKIND kind=%s http=%s bytes=%s type=%s\n' "$kind" "$code" "$size" "$ctype"
           done
-          file raw/*
-          sha256sum raw/*
-          wc -c raw/*
-      - name: Upload official source bytes
-        uses: actions/upload-artifact@v4
-        with:
-          name: estat-h24-official-source-probe
-          path: raw/
-          if-no-files-found: error
-          retention-days: 1
