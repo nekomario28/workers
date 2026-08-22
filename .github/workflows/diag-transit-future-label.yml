@@ -24,7 +24,8 @@ jobs:
           from pathlib import Path
           import shapefile
 
-          EXPECTED_CAND_SHA='1202090e0959a8460a2babc4593672b8474e24040ff70ea136662b26bf83c2d6'
+          CANONICAL_ARTIFACT_SHA='1202090e0959a8460a2babc4593672b8474e24040ff70ea136662b26bf83c2d6'
+          EXPECTED_STAGE_SHA='0e51abcfcecaed2f54062110209bb1be428091501ea0c015ae53e4c0038104ef'
           CAND_URL='https://raw.githubusercontent.com/nekomario28/workers/diag/transit-future-label/tmp/transit_future_topology_labels_v2.csv'
           N05_URL='https://nlftp.mlit.go.jp/ksj/gml/data/N05/N05-25/N05-25_GML.zip'
           s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0'})
@@ -39,12 +40,17 @@ jobs:
             return int(m.group(1)) if m else None
 
           cr=s.get(CAND_URL,timeout=30); cr.raise_for_status(); cb=cr.content
-          csha=hashlib.sha256(cb).hexdigest(); print('CANDIDATE_SHA',csha)
-          if csha!=EXPECTED_CAND_SHA: raise SystemExit(f'candidate provenance mismatch {csha}')
-          Path('out/topology_labels_v2.csv').write_bytes(cb)
+          stage_sha=hashlib.sha256(cb).hexdigest(); print('CANONICAL_ARTIFACT_SHA',CANONICAL_ARTIFACT_SHA); print('STAGED_TRANSPORT_SHA',stage_sha)
+          if stage_sha!=EXPECTED_STAGE_SHA: raise SystemExit(f'staged candidate changed {stage_sha}')
+          Path('out/topology_labels_v2_staged.csv').write_bytes(cb)
           candidates=list(csv.DictReader(io.StringIO(cb.decode('utf-8'))))
-          print('CANDIDATES',len(candidates),Counter((r['from_year'],r['to_year']) for r in candidates))
-          if len(candidates)!=195: raise SystemExit('expected 195 topology-v2 candidates')
+          got=Counter((r['from_year'],r['to_year'],r['class']) for r in candidates)
+          expected=Counter({
+            ('2011','2015','existing_geometry_recode_suspect'):13,('2011','2015','existing_line_infill_candidate'):27,('2011','2015','extension_candidate'):8,('2011','2015','new_line_candidate'):12,
+            ('2015','2020','existing_geometry_recode_suspect'):18,('2015','2020','existing_line_infill_candidate'):52,('2015','2020','extension_candidate'):11,
+            ('2020','2025','existing_geometry_recode_suspect'):7,('2020','2025','existing_line_infill_candidate'):21,('2020','2025','extension_candidate'):6,('2020','2025','new_line_candidate'):20})
+          print('CANDIDATES',len(candidates),'CLASS_COUNTS',got)
+          if len(candidates)!=195 or got!=expected: raise SystemExit('staged candidate semantics do not match topology-v2 freeze')
 
           blob=None
           for attempt in range(4):
@@ -82,11 +88,10 @@ jobs:
           for idx,sr in enumerate(rdr.iterShapeRecords()):
             d=dict(zip(fields,sr.record)); pts=sr.shape.points
             if not pts: continue
-            pt=(pts[0][1],pts[0][0])
             rec={'idx':idx,'name':str(d.get('N05_011','')),'name_n':norm(d.get('N05_011')),
                  'line':str(d.get('N05_002','')),'op':str(d.get('N05_003','')),
-                 'line_n':norm(d.get('N05_002')),'op_n':norm(d.get('N05_003')),
-                 'start':y(d.get('N05_005b')),'end':y(d.get('N05_005e')),'rel':str(d.get('N05_006','')),'pt':pt}
+                 'start':y(d.get('N05_005b')),'end':y(d.get('N05_005e')),'rel':str(d.get('N05_006','')),
+                 'pt':(pts[0][1],pts[0][0])}
             records.append(rec); byrel[rec['rel']].append(rec); byname[rec['name_n']].append(rec)
           relmeta={}
           for rel,rs in byrel.items():
@@ -97,68 +102,47 @@ jobs:
 
           out=[]; class_counts=defaultdict(Counter); exact_match=0; fallback_match=0
           for c in candidates:
-            fy=int(c['from_year']); ty=int(c['to_year']); name=c['future_station']; nn=norm(name); pt=(float(c['lat']),float(c['lon']))
-            same=[]
-            for r in byname.get(nn,[]):
-              d=hav(pt,r['pt'])
-              if d<=500: same.append((d,r))
-            mode='same_name_500m'; matched=same
+            fy=int(c['from_year']); ty=int(c['to_year']); nn=norm(c['future_station']); pt=(float(c['lat']),float(c['lon']))
+            same=[(hav(pt,r['pt']),r) for r in byname.get(nn,[]) if hav(pt,r['pt'])<=500]
+            matched=same; mode='same_name_500m'
             if not matched:
               near=[]
-              # conservative geometry-only fallback for current-name representation anomalies
               for r in records:
                 if abs(r['pt'][0]-pt[0])>0.002 or abs(r['pt'][1]-pt[1])>0.003: continue
                 d=hav(pt,r['pt'])
                 if d<=100: near.append((d,r))
               matched=near; mode='geometry_100m_fallback'
             if matched:
-              if mode.startswith('same'): exact_match+=1
-              else: fallback_match+=1
-              # only relations represented by nearest candidate-name/geometry records; relation history then supplies old names.
-              mind=min(d for d,r in matched)
-              rels=sorted(set(r['rel'] for d,r in matched if d<=mind+30.0))
-              metas=[relmeta.get(rel,{}) for rel in rels]
+              exact_match += mode.startswith('same'); fallback_match += not mode.startswith('same')
+              mind=min(d for d,r in matched); rels=sorted(set(r['rel'] for d,r in matched if d<=mind+30.0)); metas=[relmeta.get(rel,{}) for rel in rels]
               firsts=[m.get('first_start') for m in metas if m.get('first_start') not in (None,999,9999)]
-              any_pre=any(v<=fy for v in firsts)
-              any_new=any(fy<v<=ty for v in firsts)
+              any_pre=any(v<=fy for v in firsts); any_new=any(fy<v<=ty for v in firsts)
               if any_pre and any_new: audit='mixed_old_and_new_relations'
               elif any_pre: audit='preexisting_relation'
               elif any_new: audit='new_relation_in_interval'
               elif firsts and all(v>ty for v in firsts): audit='relation_starts_after_target'
               else: audit='relation_start_unknown'
-              hist_names=sorted(set(n for m in metas for n in m.get('names',[])))
-              hist_lines=sorted(set(n for m in metas for n in m.get('lines',[])))
-              hist_ops=sorted(set(n for m in metas for n in m.get('ops',[])))
-              first=min(firsts) if firsts else None
-              nearest=round(mind,2)
+              hist_names=sorted(set(n for m in metas for n in m.get('names',[]))); hist_lines=sorted(set(n for m in metas for n in m.get('lines',[]))); hist_ops=sorted(set(n for m in metas for n in m.get('ops',[])))
+              first=min(firsts) if firsts else None; nearest=round(mind,2)
             else:
-              rels=[]; first=None; audit='no_n05_match'; hist_names=[]; hist_lines=[]; hist_ops=[]; nearest=None
+              rels=[]; first=None; audit='no_n05_match'; hist_names=[]; hist_lines=[]; hist_ops=[]; nearest=None; mode='none'
             class_counts[c['class']][audit]+=1
-            out.append({**c,'n05_match_mode':mode if matched else 'none','n05_nearest_m':nearest,'n05_relation_ids':';'.join(rels),
-                        'n05_first_start':first,'n05_audit':audit,'n05_history_names':' | '.join(hist_names),
-                        'n05_history_lines':' | '.join(hist_lines),'n05_history_operators':' | '.join(hist_ops)})
+            out.append({**c,'n05_match_mode':mode,'n05_nearest_m':nearest,'n05_relation_ids':';'.join(rels),'n05_first_start':first,'n05_audit':audit,
+                        'n05_history_names':' | '.join(hist_names),'n05_history_lines':' | '.join(hist_lines),'n05_history_operators':' | '.join(hist_ops)})
           cols=list(candidates[0].keys())+['n05_match_mode','n05_nearest_m','n05_relation_ids','n05_first_start','n05_audit','n05_history_names','n05_history_lines','n05_history_operators']
           with open('out/n05_relation_audit.csv','w',encoding='utf-8',newline='') as f:
             w=csv.DictWriter(f,fieldnames=cols); w.writeheader(); w.writerows(out)
-          summary={'candidate_sha256':csha,'n05_raw_sha256':n05sha,'n05_source':used,'candidate_rows':len(candidates),
-                   'same_name_matches':exact_match,'geometry_fallback_matches':fallback_match,
-                   'class_audit_counts':{k:dict(v) for k,v in class_counts.items()}}
-          # Fixed sanity: known renames should have pre-cutoff relation history; known true additions should begin in interval.
+          summary={'canonical_topology_v2_artifact_sha256':CANONICAL_ARTIFACT_SHA,'staged_transport_sha256':stage_sha,'n05_raw_sha256':n05sha,'n05_source':used,'candidate_rows':len(candidates),
+                   'same_name_matches':exact_match,'geometry_fallback_matches':fallback_match,'class_audit_counts':{k:dict(v) for k,v in class_counts.items()}}
           lookup={(r['from_year'],r['to_year'],r['future_station']):r for r in out}
-          checks={
-            '大阪梅田': lookup.get(('2015','2020','大阪梅田'),{}).get('n05_audit'),
-            '羽田空港第3ターミナル': lookup.get(('2015','2020','羽田空港第3ターミナル'),{}).get('n05_audit'),
-            '高輪ゲートウェイ': lookup.get(('2015','2020','高輪ゲートウェイ'),{}).get('n05_audit'),
-            '梅小路京都西': lookup.get(('2015','2020','梅小路京都西'),{}).get('n05_audit'),
-            '新綱島': lookup.get(('2020','2025','新綱島'),{}).get('n05_audit'),
-          }
+          checks={k:lookup.get(key,{}).get('n05_audit') for k,key in {
+            '大阪梅田':('2015','2020','大阪梅田'),'羽田空港第3ターミナル':('2015','2020','羽田空港第3ターミナル'),
+            '高輪ゲートウェイ':('2015','2020','高輪ゲートウェイ'),'梅小路京都西':('2015','2020','梅小路京都西'),'新綱島':('2020','2025','新綱島')}.items()}
           summary['sanity']=checks
           Path('out/n05_relation_audit_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
-          print('CLASS_AUDIT',json.dumps(summary['class_audit_counts'],ensure_ascii=False))
-          print('SANITY',json.dumps(checks,ensure_ascii=False))
-          print('SUMMARY',json.dumps(summary,ensure_ascii=False))
-          expected={'大阪梅田':'preexisting_relation','羽田空港第3ターミナル':'preexisting_relation','高輪ゲートウェイ':'new_relation_in_interval','梅小路京都西':'new_relation_in_interval','新綱島':'new_relation_in_interval'}
-          bad={k:(checks.get(k),v) for k,v in expected.items() if checks.get(k)!=v}
+          print('CLASS_AUDIT',json.dumps(summary['class_audit_counts'],ensure_ascii=False)); print('SANITY',json.dumps(checks,ensure_ascii=False)); print('SUMMARY',json.dumps(summary,ensure_ascii=False))
+          expected_sanity={'大阪梅田':'preexisting_relation','羽田空港第3ターミナル':'preexisting_relation','高輪ゲートウェイ':'new_relation_in_interval','梅小路京都西':'new_relation_in_interval','新綱島':'new_relation_in_interval'}
+          bad={k:(checks.get(k),v) for k,v in expected_sanity.items() if checks.get(k)!=v}
           if bad: raise SystemExit('N05_AUDIT_SANITY_FAIL '+json.dumps(bad,ensure_ascii=False))
           PY
           sha256sum out/*
