@@ -1,4 +1,4 @@
-name: Diagnostic Holdout Physical Freeze FY2022 FY2023
+name: Diagnostic Holdout Known Future Fukuoka Full Archive
 
 on:
   pull_request:
@@ -8,115 +8,143 @@ permissions:
   contents: read
 
 jobs:
-  freeze:
+  scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
-      - name: Freeze 24-month Physical Execution for 30 regions
+      - name: Crawl 2006-2022 pre-cutoff JCSC METI-derived archive
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet 'xlrd==2.0.1' 'requests==2.32.5'
+          python3 -m pip install --quiet 'beautifulsoup4==4.13.4' 'requests==2.32.5'
           mkdir -p out
           python3 - <<'PY'
-          import csv, hashlib, json, re, requests, xlrd
+          import csv, re, time, hashlib, json
+          from datetime import date
+          from urllib.parse import urljoin
           from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
 
-          SOURCES={'FY2022':'000040052251','FY2023':'000040179628'}
-          TARGETS={
-            '13101':'千代田区','13102':'中央区','13103':'港区','13104':'新宿区','13105':'文京区','13106':'台東区','13107':'墨田区','13108':'江東区','13109':'品川区','13110':'目黒区','13111':'大田区','13112':'世田谷区','13113':'渋谷区','13114':'中野区','13115':'杉並区','13116':'豊島区','13117':'北区','13118':'荒川区','13119':'板橋区','13120':'練馬区','13121':'足立区','13122':'葛飾区','13123':'江戸川区',
-            '40131':'東区','40132':'博多区','40133':'中央区','40134':'南区','40135':'西区','40136':'城南区','40137':'早良区'}
-          CATS={'total':'全建築物計','J':'卸売業，小売業用建築物','L':'不動産業用建築物','M':'宿泊業，飲食サービス業用建築物','O':'医療，福祉用建築物'}
-          sess=requests.Session(); sess.headers['User-Agent']='Mozilla/5.0'
-          parts=[]; raw_meta={}; col_meta={}
+          CUT=date(2022,3,31); H0=date(2022,4,1); H1=date(2024,3,31)
+          NEWROOT='https://www.jcsc.or.jp/sc_data/sc_open/daitenhou'
+          OLDROOT='https://www.jcsc.or.jp/public_policy/location/index.html'
+          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0'})
+          errors=[]; pages={}
 
-          def compact(s):
-            return re.sub(r'[\s　]+','',str(s or '')).replace('，',',').replace('・','・')
+          def get(url, allow404=False):
+            try:
+              r=s.get(url,timeout=30)
+              if allow404 and r.status_code==404: return None
+              r.raise_for_status(); return r
+            except Exception as e:
+              errors.append((url,repr(e))); return None
 
-          for label,sid in SOURCES.items():
-            u=f'https://www.e-stat.go.jp/stat-search/file-download?fileKind=0&statInfId={sid}'
-            r=sess.get(u,timeout=60); r.raise_for_status(); b=r.content
-            if b[:8] != bytes.fromhex('D0CF11E0A1B11AE1'): raise SystemExit(f'{label} not expected BIFF8/OLE')
-            p=Path(f'out/{label}.xls'); p.write_bytes(b)
-            raw_sha=hashlib.sha256(b).hexdigest(); raw_meta[label]={'statInfId':sid,'sha256':raw_sha,'bytes':len(b)}
-            wb=xlrd.open_workbook(file_contents=b); sh=wb.sheet_by_name('B007')
-            header=sh.row_values(4); sub=sh.row_values(5)
-            starts=[]
-            for j,v in enumerate(header):
-              if str(v).strip(): starts.append((j,compact(v)))
-            target_cols={}
-            for key,title in CATS.items():
-              want=compact(title)
-              cand=[(j,t) for j,t in starts if want in t or (key!='total' and compact(key) and t.startswith(key))]
-              if len(cand)!=1: raise SystemExit(f'{label} category start {key} candidates={cand}')
-              j,_=cand[0]
-              next_starts=[x for x,t in starts if x>j]
-              end=min(next_starts) if next_starts else sh.ncols
-              floor=[k for k in range(j,end) if '床面積の合計' in compact(sub[k])]
-              if len(floor)!=1: raise SystemExit(f'{label} floor column {key} start={j} end={end} floor={floor}')
-              target_cols[key]=floor[0]
-            col_meta[label]=target_cols
-            print('COLUMNS',label,json.dumps(target_cols,ensure_ascii=False))
+          # Old archive uses stable /public_policy/location/YYYY/YYYYMM.html paths.
+          # Probe all months 2006-2014 so absence of an index link cannot silently hide a page.
+          old_probe={}
+          for y in range(2006,2015):
+            for m in range(1,13):
+              u=f'https://www.jcsc.or.jp/public_policy/location/{y}/{y}{m:02d}.html'
+              try:
+                r=s.get(u,timeout=30)
+                old_probe[f'{y}-{m:02d}']=r.status_code
+                if r.status_code==200 and '大店立地法' in r.text:
+                  pages[(y,m,u)]=r.text
+                elif r.status_code not in (200,404):
+                  errors.append((u,f'HTTP {r.status_code}'))
+              except Exception as e:
+                errors.append((u,repr(e)))
+              time.sleep(0.01)
 
-            found={}
-            for i in range(sh.nrows):
-              cell=str(sh.cell_value(i,1)).strip()
-              m=re.match(r'^(\d{5})(.*)$',cell)
-              if not m: continue
-              code=m.group(1)
-              if code not in TARGETS: continue
-              if code in found: raise SystemExit(f'{label} duplicate target {code}')
-              vals={}
-              for key,col in target_cols.items():
-                v=sh.cell_value(i,col)
-                if isinstance(v,(int,float)):
-                  vals[key]=float(v)
-                else:
-                  s=str(v).strip()
-                  if s in ('','-','＊','*','X','x'): raise SystemExit(f'{label} suppressed/missing {code} {key}={v!r}')
-                  try: vals[key]=float(s.replace(',',''))
-                  except: raise SystemExit(f'{label} nonnumeric {code} {key}={v!r}')
-                if vals[key] < 0: raise SystemExit(f'{label} negative {code} {key}')
-              found[code]=vals
-              parts.append({'period':label,'region_code':code,'region_name':TARGETS[code],'metro':'Tokyo' if code.startswith('13') else 'Fukuoka',
-                            **{f'floor_area_{k}':vals[k] for k in CATS}})
-            if set(found)!=set(TARGETS): raise SystemExit(f'{label} coverage mismatch missing={sorted(set(TARGETS)-set(found))}')
-            print('GATE_PERIOD',label,'regions=30 unique=30 numeric_cells=150 missing=0 suppressed=0')
+          # New archive: discover year/month pages from the live index, but stop at cutoff.
+          root=get(NEWROOT)
+          if root is None: raise SystemExit('cannot fetch JCSC current archive root')
+          soup=BeautifulSoup(root.text,'html.parser')
+          year_links=[]
+          for a in soup.find_all('a',href=True):
+            t=' '.join(a.stripped_strings); u=urljoin(root.url,a['href'])
+            m=re.fullmatch(r'(20\d{2})年',t)
+            if m and 2015 <= int(m.group(1)) <= 2022:
+              year_links.append((int(m.group(1)),u))
+          seen=set(); year_links=[x for x in year_links if not (x[1] in seen or seen.add(x[1]))]
+          for y,yu in year_links:
+            yr=get(yu)
+            if yr is None: continue
+            ys=BeautifulSoup(yr.text,'html.parser')
+            for a in ys.find_all('a',href=True):
+              t=' '.join(a.stripped_strings); u=urljoin(yr.url,a['href'])
+              mm=re.search(r'(20\d{2})年\s*(\d{1,2})月',t)
+              if not mm or '/pt_location/' not in u: continue
+              yy,mo=map(int,mm.groups())
+              if yy!=y or date(yy,mo,1)>date(2022,3,1): continue
+              if any(k[0]==yy and k[1]==mo and k[2]==u for k in pages): continue
+              mr=get(u)
+              if mr is not None: pages[(yy,mo,u)]=mr.text
+              time.sleep(0.01)
 
-          parts=sorted(parts,key=lambda r:(r['region_code'],r['period']))
-          agg=[]
-          for code in sorted(TARGETS):
-            rr=[r for r in parts if r['region_code']==code]
-            if len(rr)!=2: raise SystemExit(f'parts count {code} {len(rr)}')
-            row={'region_code':code,'region_name':TARGETS[code],'metro':'Tokyo' if code.startswith('13') else 'Fukuoka'}
-            for key in CATS:
-              total=sum(r[f'floor_area_{key}'] for r in rr)
-              if abs(total-round(total))<1e-9: total=int(round(total))
-              row[f'floor_area_{key}_h24']=total
-            agg.append(row)
+          # Root can expose recent months outside year pages.
+          for a in soup.find_all('a',href=True):
+            t=' '.join(a.stripped_strings); u=urljoin(root.url,a['href'])
+            mm=re.search(r'(20\d{2})年\s*(\d{1,2})月',t)
+            if mm and '/pt_location/' in u:
+              yy,mo=map(int,mm.groups())
+              if 2015<=yy<=2022 and date(yy,mo,1)<=date(2022,3,1):
+                key=(yy,mo,u)
+                if key not in pages:
+                  mr=get(u)
+                  if mr is not None: pages[key]=mr.text
 
-          part_path=Path('out/physical_execution_holdout_2022_parts.csv')
-          with part_path.open('w',encoding='utf-8',newline='') as f:
-            fields=list(parts[0].keys()); w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(parts)
-          agg_path=Path('out/physical_execution_holdout_2022_h24.csv')
-          with agg_path.open('w',encoding='utf-8',newline='') as f:
-            fields=list(agg[0].keys()); w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(agg)
+          rows=[]; hits=[]
+          for (y,m,u),html in sorted(pages.items()):
+            ps=BeautifulSoup(html,'html.parser')
+            for tr in ps.find_all('tr'):
+              cells=[' '.join(td.stripped_strings) for td in tr.find_all(['th','td'])]
+              if not cells or '福岡市' not in ' | '.join(cells): continue
+              joined=' || '.join(cells)
+              dates=[]
+              for yy,mm,dd in re.findall(r'(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日',joined):
+                try: dates.append(date(int(yy),int(mm),int(dd)))
+                except ValueError: pass
+              rec={'filing_year':y,'filing_month':m,'source_url':u,'dates':','.join(d.isoformat() for d in dates),'cells':joined}
+              rows.append(rec)
+              if date(y,m,1)<=date(2022,3,1) and any(H0<=d<=H1 for d in dates): hits.append(rec)
+
+          # Deduplicate page aliases by filing month + exact row content.
+          def dedup(rs):
+            out=[]; seen=set()
+            for r in rs:
+              k=(r['filing_year'],r['filing_month'],r['cells'])
+              if k in seen: continue
+              seen.add(k); out.append(r)
+            return out
+          rows=dedup(rows); hits=dedup(hits)
+
+          for name,data in [('fukuoka_all_rows_2006_2022.tsv',rows),('fukuoka_holdout_h24_candidates.tsv',hits)]:
+            p=Path('out')/name
+            with p.open('w',encoding='utf-8',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=['filing_year','filing_month','source_url','dates','cells'],delimiter='\t'); w.writeheader(); w.writerows(data)
+
           meta={
-            'cutoff':'2022-03-31','answer_window':'2022-04-01..2024-03-31','regions':30,'Tokyo':23,'Fukuoka':7,
-            'periods':['FY2022','FY2023'],'sources':raw_meta,'floor_columns_zero_based':col_meta,
-            'categories':CATS,'parts_sha256':hashlib.sha256(part_path.read_bytes()).hexdigest(),
-            'aggregate_sha256':hashlib.sha256(agg_path.read_bytes()).hexdigest(),'zero_fill':False,
+            'cutoff':'2022-03-31','answer_window':'2022-04-01..2024-03-31',
+            'old_month_urls_probed':len(old_probe),'old_http_200':sum(v==200 for v in old_probe.values()),
+            'old_http_404':sum(v==404 for v in old_probe.values()),'new_year_links':len(year_links),
+            'parsed_month_pages':len(pages),'fukuoka_rows':len(rows),'h24_candidate_rows':len(hits),'errors':errors,
+            'page_range':[min((f'{y:04d}-{m:02d}' for y,m,u in pages),default=None),max((f'{y:04d}-{m:02d}' for y,m,u in pages),default=None)],
+            'transport_note':'JCSC tables state they are compiled from METI/prefecture/designated-city new-store notifications; used as archival transport for Fukuoka City.',
           }
-          Path('out/physical_execution_holdout_2022_meta.json').write_text(json.dumps(meta,ensure_ascii=False,indent=2),encoding='utf-8')
-          print('GATE_FINAL regions=30 periods=2 rows=60 numeric_cells=300 duplicate=0 missing=0 suppressed=0 zero_fill=0')
-          print('AGG_SHA',meta['aggregate_sha256']); print('PARTS_SHA',meta['parts_sha256']); print('META',json.dumps(meta,ensure_ascii=False))
-          for r in agg: print('ROW',json.dumps(r,ensure_ascii=False))
+          mp=Path('out/scan_meta.json'); mp.write_text(json.dumps(meta,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('META',json.dumps(meta,ensure_ascii=False))
+          print('=== HOLDOUT H24 CANDIDATES ===')
+          for r in hits: print(r['filing_year'],r['filing_month'],r['dates'],r['cells'])
+          for p in sorted(Path('out').iterdir()): print('SHA',p.name,hashlib.sha256(p.read_bytes()).hexdigest())
+          if errors: raise SystemExit('archive crawl had fetch errors; do not freeze')
+          if not pages or min(y for y,m,u in pages)>2006 or max(y for y,m,u in pages)<2022: raise SystemExit('archive range incomplete')
           PY
-          sha256sum out/*
-      - name: Upload frozen Physical Execution
+      - name: Upload Fukuoka full archive evidence
         uses: actions/upload-artifact@v4
         with:
-          name: holdout-physical-freeze-2022
+          name: holdout-known-future-fukuoka-full-archive
           path: out/
           if-no-files-found: error
           retention-days: 1
