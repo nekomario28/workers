@@ -16,12 +16,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet 'openpyxl==3.1.5' 'requests==2.32.5'
+          python3 -m pip install --quiet 'openpyxl==3.1.5' 'xlrd==2.0.1' 'requests==2.32.5'
           mkdir -p out
           python3 - <<'PY'
           import csv, hashlib, json, math, requests
           from pathlib import Path
-          import openpyxl
+          import openpyxl, xlrd
 
           SOURCES={
             '2020_main':'000031971203',
@@ -33,25 +33,39 @@ jobs:
             '13101':'千代田区','13102':'中央区','13103':'港区','13104':'新宿区','13105':'文京区','13106':'台東区','13107':'墨田区','13108':'江東区','13109':'品川区','13110':'目黒区','13111':'大田区','13112':'世田谷区','13113':'渋谷区','13114':'中野区','13115':'杉並区','13116':'豊島区','13117':'北区','13118':'荒川区','13119':'板橋区','13120':'練馬区','13121':'足立区','13122':'葛飾区','13123':'江戸川区',
             '40131':'福岡市東区','40132':'福岡市博多区','40133':'福岡市中央区','40134':'福岡市南区','40135':'福岡市西区','40136':'福岡市城南区','40137':'福岡市早良区'
           }
-          shas={}; books={}
+          shas={}; rows_by_source={}; formats={}
           sess=requests.Session(); sess.headers['User-Agent']='Mozilla/5.0'
+
+          def load_rows(blob,label):
+            if blob[:4]==b'PK\x03\x04':
+              p=Path(f'out/{label}.xlsx'); p.write_bytes(blob)
+              wb=openpyxl.load_workbook(p,data_only=True,read_only=True); ws=wb.worksheets[0]
+              formats[label]='OOXML'
+              return [tuple(r) for r in ws.iter_rows(values_only=True)]
+            if blob[:8]==bytes.fromhex('D0CF11E0A1B11AE1'):
+              p=Path(f'out/{label}.xls'); p.write_bytes(blob)
+              wb=xlrd.open_workbook(file_contents=blob); sh=wb.sheet_by_index(0)
+              formats[label]='BIFF8/OLE'
+              return [tuple(sh.row_values(i)) for i in range(sh.nrows)]
+            raise SystemExit(f'unknown excel signature {label} {blob[:8]!r}')
+
           for label,sid in SOURCES.items():
             u=f'https://www.e-stat.go.jp/stat-search/file-download?fileKind=0&statInfId={sid}'
             r=sess.get(u,timeout=60); r.raise_for_status()
-            p=Path(f'out/{label}.xlsx'); p.write_bytes(r.content)
             shas[label]=hashlib.sha256(r.content).hexdigest()
-            books[label]=openpyxl.load_workbook(p,data_only=True,read_only=True)
-            print('SOURCE',label,sid,len(r.content),shas[label],books[label].sheetnames)
+            rows_by_source[label]=load_rows(r.content,label)
+            print('SOURCE',label,sid,len(r.content),formats[label],shas[label],len(rows_by_source[label]))
 
           def code5(v):
             s=str(v or '').strip()
             if s.endswith('.0'): s=s[:-2]
             return s[:5] if len(s)>=5 and s[:5].isdigit() else None
 
-          def main_rows(wb):
-            ws=wb.worksheets[0]; out={}
-            for row in ws.iter_rows(values_only=True):
-              c=code5(row[0] if row else None)
+          def main_rows(rows):
+            out={}
+            for row in rows:
+              if len(row)<=24: continue
+              c=code5(row[0])
               if c in TARGETS:
                 if c in out: raise SystemExit(f'duplicate main row {c}')
                 out[c]={
@@ -62,10 +76,11 @@ jobs:
                 }
             return out
 
-          def age_rows(wb):
-            ws=wb.worksheets[0]; out={}
-            for row in ws.iter_rows(values_only=True):
-              c=code5(row[0] if row else None)
+          def age_rows(rows):
+            out={}
+            for row in rows:
+              if len(row)<=10: continue
+              c=code5(row[0])
               if c not in TARGETS: continue
               sex=str(row[3] or '').strip()
               if sex!='計': continue
@@ -74,8 +89,8 @@ jobs:
               out[c]={'total':total,'age20_29':a20+a25}
             return out
 
-          m20=main_rows(books['2020_main']); a20=age_rows(books['2020_age'])
-          m21=main_rows(books['2021_main']); a21=age_rows(books['2021_age'])
+          m20=main_rows(rows_by_source['2020_main']); a20=age_rows(rows_by_source['2020_age'])
+          m21=main_rows(rows_by_source['2021_main']); a21=age_rows(rows_by_source['2021_age'])
           expected=set(TARGETS)
           for label,d in [('2020_main',m20),('2020_age',a20),('2021_main',m21),('2021_age',a21)]:
             if set(d)!=expected: raise SystemExit(f'{label} coverage mismatch missing={sorted(expected-set(d))} extra={sorted(set(d)-expected)}')
@@ -100,15 +115,9 @@ jobs:
             w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(rows)
           csv_sha=hashlib.sha256(outp.read_bytes()).hexdigest()
           meta={
-            'cutoff':'2022-03-31',
-            'regions':30,
-            'Tokyo':23,
-            'Fukuoka':7,
-            'source_statInfId':SOURCES,
-            'source_sha256':shas,
-            'features':fields[3:],
-            'csv_sha256':csv_sha,
-            'zero_fill':False,
+            'cutoff':'2022-03-31','regions':30,'Tokyo':23,'Fukuoka':7,
+            'source_statInfId':SOURCES,'source_sha256':shas,'source_format':formats,
+            'features':fields[3:],'csv_sha256':csv_sha,'zero_fill':False,
           }
           Path('out/demand_momentum_holdout_2022_meta.json').write_text(json.dumps(meta,ensure_ascii=False,indent=2),encoding='utf-8')
           print('GATE regions=30 unique=30 complete_sources=4 no_missing=1 no_zero_fill=1')
