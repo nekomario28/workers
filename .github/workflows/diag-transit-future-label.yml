@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   audit:
@@ -14,20 +15,27 @@ jobs:
     steps:
       - name: Audit N02-only topology labels against research-only N05 history
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           python3 -m pip install --quiet 'requests==2.32.5' 'pyshp==2.3.1'
-          mkdir -p out
+          mkdir -p input out
+          curl --fail --location --silent --show-error \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            'https://api.github.com/repos/nekomario28/workers/actions/artifacts/9481427242/zip' \
+            -o /tmp/topology-v2.zip
+          unzip -q /tmp/topology-v2.zip -d input
           python3 - <<'PY'
           import csv, hashlib, io, json, math, re, requests, unicodedata, zipfile
           from collections import defaultdict, Counter
           from pathlib import Path
           import shapefile
 
-          HEAD='cd7f9758fc1ca5b6135c136e5d92be32c6656771'
           CANONICAL_SHA='1202090e0959a8460a2babc4593672b8474e24040ff70ea136662b26bf83c2d6'
-          url=f'https://raw.githubusercontent.com/nekomario28/workers/{HEAD}/tmp/transit_future_topology_labels_v2.csv'
-          cb=requests.get(url,headers={'User-Agent':'Mozilla/5.0'},timeout=60).content
+          p=Path('input/topology_labels_v2.csv'); cb=p.read_bytes()
           csha=hashlib.sha256(cb).hexdigest(); print('CANDIDATE_SHA',csha)
           if csha!=CANONICAL_SHA: raise SystemExit(f'canonical artifact mismatch {csha}')
           candidates=list(csv.DictReader(io.StringIO(cb.decode('utf-8'))))
@@ -83,7 +91,10 @@ jobs:
           out=[]; class_counts=defaultdict(Counter); guard_counts=Counter(); match_counts=Counter()
           for c in candidates:
             fy=int(c['from_year']); ty=int(c['to_year']); pt=(float(c['lat']),float(c['lon'])); nn=norm(c['future_station'])
-            same=[(hav(pt,r['pt']),r) for r in byname.get(nn,[]) if hav(pt,r['pt'])<=500]
+            same=[]
+            for r in byname.get(nn,[]):
+              d=hav(pt,r['pt'])
+              if d<=500: same.append((d,r))
             matched=same; mode='same_name_500m'
             if not matched:
               near=[]
@@ -95,9 +106,8 @@ jobs:
             if matched:
               match_counts[mode]+=1; mind=min(d for d,r in matched)
               rels=sorted(set(r['rel'] for d,r in matched if d<=mind+30.0))
-              local=[]; glob=[]
-              for rel in rels:
-                glob.extend(byrel[rel]); local.extend(r for r in byrel[rel] if hav(pt,r['pt'])<=500)
+              local=[]
+              for rel in rels: local.extend(r for r in byrel[rel] if hav(pt,r['pt'])<=500)
               starts=[r['start'] for r in local if r['start'] not in (None,999,9999)]
               any_pre=any(v<=fy for v in starts); any_new=any(fy<v<=ty for v in starts)
               if any_pre and any_new: audit='local_mixed_old_and_new_relations'
@@ -109,8 +119,6 @@ jobs:
             else:
               match_counts['none']+=1; rels=[]; audit='no_n05_match'; local_names=[]; nearest=None; mode='none'
 
-            # Commercial-safe guard uses only fields already present in the N02-derived v2 table.
-            # The 300m threshold was pre-existing in v2; this audit does not tune a new threshold on N05.
             cls=c['class']; near300=(c['near_prior_station_300m']=='True')
             if cls in ('new_line_candidate','extension_candidate'):
               guard='keep_new_line_or_extension'
