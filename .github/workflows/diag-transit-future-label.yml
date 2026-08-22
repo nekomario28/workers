@@ -1,4 +1,4 @@
-name: Diagnostic Transit Future N05 Relation Audit
+name: Diagnostic Transit Future N05 Spatial Relation Audit
 
 on:
   pull_request:
@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: Audit exact topology-v2 artifact against research-only N05 history
+      - name: Audit exact topology-v2 artifact against spatially local N05 history
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -35,21 +35,14 @@ jobs:
           import shapefile
 
           CANONICAL_SHA='1202090e0959a8460a2babc4593672b8474e24040ff70ea136662b26bf83c2d6'
-          p=Path('input/topology_labels_v2.csv')
-          if not p.exists(): raise SystemExit('exact topology_labels_v2.csv missing from artifact')
-          cb=p.read_bytes(); csha=hashlib.sha256(cb).hexdigest(); print('CANDIDATE_SHA',csha)
+          LOCAL_HISTORY_M=500.0
+          p=Path('input/topology_labels_v2.csv'); cb=p.read_bytes(); csha=hashlib.sha256(cb).hexdigest()
+          print('CANDIDATE_SHA',csha)
           if csha!=CANONICAL_SHA: raise SystemExit(f'canonical artifact mismatch {csha}')
           candidates=list(csv.DictReader(io.StringIO(cb.decode('utf-8'))))
-          got=Counter((r['from_year'],r['to_year'],r['class']) for r in candidates)
-          expected=Counter({
-            ('2011','2015','existing_geometry_recode_suspect'):13,('2011','2015','existing_line_infill_candidate'):27,('2011','2015','extension_candidate'):8,('2011','2015','new_line_candidate'):12,
-            ('2015','2020','existing_geometry_recode_suspect'):18,('2015','2020','existing_line_infill_candidate'):52,('2015','2020','extension_candidate'):11,
-            ('2020','2025','existing_geometry_recode_suspect'):7,('2020','2025','existing_line_infill_candidate'):21,('2020','2025','extension_candidate'):6,('2020','2025','new_line_candidate'):20})
-          print('CANDIDATES',len(candidates),'CLASS_COUNTS',got)
-          if len(candidates)!=195 or got!=expected: raise SystemExit('canonical candidate semantics mismatch')
+          if len(candidates)!=195: raise SystemExit(f'expected 195 candidates, got {len(candidates)}')
           Path('out/topology_labels_v2.csv').write_bytes(cb)
 
-          N05_URL='https://nlftp.mlit.go.jp/ksj/gml/data/N05/N05-25/N05-25_GML.zip'
           s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0'})
           def norm(x): return ''.join(unicodedata.normalize('NFKC',str(x or '')).split())
           def hav(a,b):
@@ -61,24 +54,20 @@ jobs:
             m=re.search(r'(19\d{2}|20\d{2}|9999|999)',str(v or ''))
             return int(m.group(1)) if m else None
 
-          blob=None
+          url='https://nlftp.mlit.go.jp/ksj/gml/data/N05/N05-25/N05-25_GML.zip'
           for attempt in range(4):
             try:
-              rr=s.get(N05_URL,timeout=120); rr.raise_for_status()
-              if rr.content[:2]!=b'PK': raise RuntimeError('N05 response is not ZIP')
-              blob=rr.content; break
+              rr=s.get(url,timeout=120); rr.raise_for_status(); blob=rr.content
+              if blob[:2]!=b'PK': raise RuntimeError('not ZIP')
+              break
             except Exception as e:
               print('N05_FETCH_RETRY',attempt+1,repr(e))
               if attempt==3: raise
-          n05sha=hashlib.sha256(blob).hexdigest()
-          z=zipfile.ZipFile(io.BytesIO(blob)); names=z.namelist()
-          print('N05_ZIP',len(blob),n05sha,'FILES',len(names),names[:80])
+          n05sha=hashlib.sha256(blob).hexdigest(); z=zipfile.ZipFile(io.BytesIO(blob)); names=z.namelist()
           station_files=sorted([n for n in names if n.lower().endswith('station2.shp')],key=lambda n:(0 if '/UTF-8/' in n else 1,n))
-          if not station_files: raise SystemExit('Station2.shp not found')
           rdr=None; used=None
           for shpname in station_files:
-            base=shpname[:-4]
-            need={e:next((n for n in names if n.lower()==(base+e).lower()),None) for e in ['.shp','.shx','.dbf']}
+            base=shpname[:-4]; need={e:next((n for n in names if n.lower()==(base+e).lower()),None) for e in ['.shp','.shx','.dbf']}
             if not all(need.values()): continue
             for enc in (['utf-8','cp932'] if '/UTF-8/' in shpname else ['cp932','utf-8']):
               try:
@@ -87,33 +76,22 @@ jobs:
                 rdr=x; used=(shpname,enc); break
               except UnicodeDecodeError: continue
             if rdr is not None: break
-          if rdr is None: raise SystemExit('cannot decode Station2')
+          if rdr is None: raise SystemExit('cannot decode N05 Station2')
           fields=[f[0] for f in rdr.fields[1:]]
           required={'N05_002','N05_003','N05_005b','N05_005e','N05_006','N05_011'}
           if not required.issubset(fields): raise SystemExit('missing N05 fields '+repr(sorted(required-set(fields))))
-          print('N05_STATION_SOURCE',used,'ROWS',len(rdr),'FIELDS',fields)
-
           records=[]; byrel=defaultdict(list); byname=defaultdict(list)
           for idx,sr in enumerate(rdr.iterShapeRecords()):
             d=dict(zip(fields,sr.record)); pts=sr.shape.points
             if not pts: continue
-            rec={'idx':idx,'name':str(d.get('N05_011','')),'name_n':norm(d.get('N05_011')),
-                 'line':str(d.get('N05_002','')),'op':str(d.get('N05_003','')),
-                 'start':year(d.get('N05_005b')),'end':year(d.get('N05_005e')),'rel':str(d.get('N05_006','')),
-                 'pt':(pts[0][1],pts[0][0])}
+            rec={'idx':idx,'name':str(d.get('N05_011','')),'name_n':norm(d.get('N05_011')),'line':str(d.get('N05_002','')),'op':str(d.get('N05_003','')),
+                 'start':year(d.get('N05_005b')),'end':year(d.get('N05_005e')),'rel':str(d.get('N05_006','')),'pt':(pts[0][1],pts[0][0])}
             records.append(rec); byrel[rec['rel']].append(rec); byname[rec['name_n']].append(rec)
-          relmeta={}
-          for rel,rs in byrel.items():
-            starts=[r['start'] for r in rs if r['start'] not in (None,999,9999)]
-            relmeta[rel]={'first_start':min(starts) if starts else None,
-                          'names':sorted(set(r['name'] for r in rs)),
-                          'lines':sorted(set(r['line'] for r in rs)),
-                          'ops':sorted(set(r['op'] for r in rs))}
-          print('N05_RELATIONS',len(relmeta),'STATION_RECORDS',len(records))
+          print('N05',n05sha,'SOURCE',used,'ROWS',len(records),'RELATIONS',len(byrel))
 
-          out=[]; class_counts=defaultdict(Counter); exact_match=0; fallback_match=0
+          out=[]; class_counts=defaultdict(Counter); match_counts=Counter()
           for c in candidates:
-            fy=int(c['from_year']); ty=int(c['to_year']); nn=norm(c['future_station']); pt=(float(c['lat']),float(c['lon']))
+            fy=int(c['from_year']); ty=int(c['to_year']); pt=(float(c['lat']),float(c['lon'])); nn=norm(c['future_station'])
             same=[]
             for r in byname.get(nn,[]):
               d=hav(pt,r['pt'])
@@ -127,56 +105,51 @@ jobs:
                 if d<=100: near.append((d,r))
               matched=near; mode='geometry_100m_fallback'
             if matched:
-              if mode.startswith('same'): exact_match+=1
-              else: fallback_match+=1
-              mind=min(d for d,r in matched)
+              match_counts[mode]+=1; mind=min(d for d,r in matched)
               rels=sorted(set(r['rel'] for d,r in matched if d<=mind+30.0))
-              metas=[relmeta.get(rel,{}) for rel in rels]
-              firsts=[m.get('first_start') for m in metas if m.get('first_start') not in (None,999,9999)]
-              any_pre=any(v<=fy for v in firsts); any_new=any(fy<v<=ty for v in firsts)
-              if any_pre and any_new: audit='mixed_old_and_new_relations'
-              elif any_pre: audit='preexisting_relation'
-              elif any_new: audit='new_relation_in_interval'
-              elif firsts and all(v>ty for v in firsts): audit='relation_starts_after_target'
-              else: audit='relation_start_unknown'
-              hist_names=sorted(set(n for m in metas for n in m.get('names',[])))
-              hist_lines=sorted(set(n for m in metas for n in m.get('lines',[])))
-              hist_ops=sorted(set(n for m in metas for n in m.get('ops',[])))
-              first=min(firsts) if firsts else None; nearest=round(mind,2)
+              local_hist=[]; global_hist=[]
+              for rel in rels:
+                global_hist.extend(byrel[rel])
+                local_hist.extend(r for r in byrel[rel] if hav(pt,r['pt'])<=LOCAL_HISTORY_M)
+              local_starts=[r['start'] for r in local_hist if r['start'] not in (None,999,9999)]
+              global_starts=[r['start'] for r in global_hist if r['start'] not in (None,999,9999)]
+              any_pre=any(v<=fy for v in local_starts); any_new=any(fy<v<=ty for v in local_starts)
+              if any_pre and any_new: audit='local_mixed_old_and_new_relations'
+              elif any_pre: audit='local_preexisting_relation'
+              elif any_new: audit='local_new_relation_in_interval'
+              elif local_starts and all(v>ty for v in local_starts): audit='local_relation_starts_after_target'
+              else: audit='local_relation_start_unknown'
+              local_first=min(local_starts) if local_starts else None; global_first=min(global_starts) if global_starts else None
+              local_names=sorted(set(r['name'] for r in local_hist)); global_names=sorted(set(r['name'] for r in global_hist))
+              local_lines=sorted(set(r['line'] for r in local_hist)); local_ops=sorted(set(r['op'] for r in local_hist))
+              nearest=round(mind,2)
             else:
-              rels=[]; first=None; audit='no_n05_match'; hist_names=[]; hist_lines=[]; hist_ops=[]; nearest=None; mode='none'
+              match_counts['none']+=1; rels=[]; audit='no_n05_match'; local_first=global_first=None; local_names=[]; global_names=[]; local_lines=[]; local_ops=[]; nearest=None; mode='none'
             class_counts[c['class']][audit]+=1
-            out.append({**c,'n05_match_mode':mode,'n05_nearest_m':nearest,'n05_relation_ids':';'.join(rels),
-                        'n05_first_start':first,'n05_audit':audit,'n05_history_names':' | '.join(hist_names),
-                        'n05_history_lines':' | '.join(hist_lines),'n05_history_operators':' | '.join(hist_ops)})
-          cols=list(candidates[0].keys())+['n05_match_mode','n05_nearest_m','n05_relation_ids','n05_first_start','n05_audit','n05_history_names','n05_history_lines','n05_history_operators']
-          with open('out/n05_relation_audit.csv','w',encoding='utf-8',newline='') as f:
+            out.append({**c,'n05_match_mode':mode,'n05_nearest_m':nearest,'n05_relation_ids':';'.join(rels),'n05_global_first_start':global_first,
+                        'n05_local_first_start':local_first,'n05_spatial_audit':audit,'n05_local_history_names':' | '.join(local_names),
+                        'n05_global_history_names':' | '.join(global_names),'n05_local_history_lines':' | '.join(local_lines),'n05_local_history_operators':' | '.join(local_ops)})
+          cols=list(candidates[0].keys())+['n05_match_mode','n05_nearest_m','n05_relation_ids','n05_global_first_start','n05_local_first_start','n05_spatial_audit','n05_local_history_names','n05_global_history_names','n05_local_history_lines','n05_local_history_operators']
+          with open('out/n05_spatial_relation_audit.csv','w',encoding='utf-8',newline='') as f:
             w=csv.DictWriter(f,fieldnames=cols); w.writeheader(); w.writerows(out)
-          summary={'canonical_topology_v2_sha256':CANONICAL_SHA,'n05_raw_sha256':n05sha,'n05_source':used,'candidate_rows':len(candidates),
-                   'same_name_matches':exact_match,'geometry_fallback_matches':fallback_match,
-                   'class_audit_counts':{k:dict(v) for k,v in class_counts.items()}}
           lookup={(r['from_year'],r['to_year'],r['future_station']):r for r in out}
-          checks={k:lookup.get(key,{}).get('n05_audit') for k,key in {
-            '大阪梅田':('2015','2020','大阪梅田'),
-            '羽田空港第3ターミナル':('2015','2020','羽田空港第3ターミナル'),
-            '高輪ゲートウェイ':('2015','2020','高輪ゲートウェイ'),
-            '梅小路京都西':('2015','2020','梅小路京都西'),
-            '新綱島':('2020','2025','新綱島')}.items()}
-          summary['sanity']=checks
-          Path('out/n05_relation_audit_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
-          print('CLASS_AUDIT',json.dumps(summary['class_audit_counts'],ensure_ascii=False))
-          print('SANITY',json.dumps(checks,ensure_ascii=False))
-          print('SUMMARY',json.dumps(summary,ensure_ascii=False))
-          expected_sanity={'大阪梅田':'preexisting_relation','羽田空港第3ターミナル':'preexisting_relation','高輪ゲートウェイ':'new_relation_in_interval','梅小路京都西':'new_relation_in_interval','新綱島':'new_relation_in_interval'}
-          bad={k:(checks.get(k),v) for k,v in expected_sanity.items() if checks.get(k)!=v}
-          if bad: raise SystemExit('N05_AUDIT_SANITY_FAIL '+json.dumps(bad,ensure_ascii=False))
+          checks={k:lookup.get(key,{}).get('n05_spatial_audit') for k,key in {
+            '大阪梅田':('2015','2020','大阪梅田'),'羽田空港第3ターミナル':('2015','2020','羽田空港第3ターミナル'),
+            '高輪ゲートウェイ':('2015','2020','高輪ゲートウェイ'),'梅小路京都西':('2015','2020','梅小路京都西'),'新綱島':('2020','2025','新綱島')}.items()}
+          summary={'canonical_topology_v2_sha256':CANONICAL_SHA,'n05_raw_sha256':n05sha,'local_history_m':LOCAL_HISTORY_M,'candidate_rows':len(candidates),
+                   'match_counts':dict(match_counts),'class_audit_counts':{k:dict(v) for k,v in class_counts.items()},'sanity':checks}
+          Path('out/n05_spatial_relation_audit_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('CLASS_AUDIT',json.dumps(summary['class_audit_counts'],ensure_ascii=False)); print('SANITY',json.dumps(checks,ensure_ascii=False)); print('SUMMARY',json.dumps(summary,ensure_ascii=False))
+          expected={'大阪梅田':'local_preexisting_relation','羽田空港第3ターミナル':'local_preexisting_relation','高輪ゲートウェイ':'local_new_relation_in_interval','梅小路京都西':'local_new_relation_in_interval','新綱島':'local_new_relation_in_interval'}
+          bad={k:(checks.get(k),v) for k,v in expected.items() if checks.get(k)!=v}
+          if bad: raise SystemExit('N05_SPATIAL_SANITY_FAIL '+json.dumps(bad,ensure_ascii=False))
           PY
           sha256sum out/*
-      - name: Upload N05 relation audit
+      - name: Upload N05 spatial relation audit
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: transit-future-n05-relation-audit
+          name: transit-future-n05-spatial-relation-audit
           path: out/
           if-no-files-found: warn
           retention-days: 1
