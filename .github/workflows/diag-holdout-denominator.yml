@@ -1,4 +1,4 @@
-name: Diagnostic Holdout Demand Inspect 2021
+name: Diagnostic Holdout Demand Freeze 2020-2021
 
 on:
   pull_request:
@@ -8,44 +8,119 @@ permissions:
   contents: read
 
 jobs:
-  inspect:
+  freeze:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Inspect 2021 cutoff-safe resident-registry xlsx workbooks
+      - name: Freeze cutoff-safe 2020-2021 Demand Momentum for 30 regions
         shell: bash
         run: |
           set -euo pipefail
           python3 -m pip install --quiet 'openpyxl==3.1.5' 'requests==2.32.5'
           mkdir -p out
           python3 - <<'PY'
-          import requests,hashlib
+          import csv, hashlib, json, math, requests
           from pathlib import Path
           import openpyxl
-          for label,sid in [('2021_main','000040306659'),('2021_age','000040306661')]:
+
+          SOURCES={
+            '2020_main':'000031971203',
+            '2020_age':'000031971230',
+            '2021_main':'000040306659',
+            '2021_age':'000040306661',
+          }
+          TARGETS={
+            '13101':'千代田区','13102':'中央区','13103':'港区','13104':'新宿区','13105':'文京区','13106':'台東区','13107':'墨田区','13108':'江東区','13109':'品川区','13110':'目黒区','13111':'大田区','13112':'世田谷区','13113':'渋谷区','13114':'中野区','13115':'杉並区','13116':'豊島区','13117':'北区','13118':'荒川区','13119':'板橋区','13120':'練馬区','13121':'足立区','13122':'葛飾区','13123':'江戸川区',
+            '40131':'福岡市東区','40132':'福岡市博多区','40133':'福岡市中央区','40134':'福岡市南区','40135':'福岡市西区','40136':'福岡市城南区','40137':'福岡市早良区'
+          }
+          shas={}; books={}
+          sess=requests.Session(); sess.headers['User-Agent']='Mozilla/5.0'
+          for label,sid in SOURCES.items():
             u=f'https://www.e-stat.go.jp/stat-search/file-download?fileKind=0&statInfId={sid}'
-            r=requests.get(u,headers={'User-Agent':'Mozilla/5.0'},timeout=60); r.raise_for_status(); Path(f'out/{label}.xlsx').write_bytes(r.content)
-            print('SHA',label,hashlib.sha256(r.content).hexdigest())
-            wb=openpyxl.load_workbook(f'out/{label}.xlsx',data_only=True,read_only=True)
-            print('SHEETS',label,wb.sheetnames)
-            for ws in wb.worksheets:
-              print('SHEET',ws.title,ws.max_row,ws.max_column)
-              for ri,row in enumerate(ws.iter_rows(min_row=1,max_row=min(ws.max_row,18),values_only=True),start=1):
-                vals=[f'{i}:{v}' for i,v in enumerate(row) if v not in (None,'')]
-                if vals: print('HEAD',label,ri,' || '.join(vals)[:7000])
-              hit=0
-              for ri,row in enumerate(ws.iter_rows(values_only=True),start=1):
-                code=str(row[0] or '')
-                if code.startswith('13101') or code.startswith('40131'):
-                  vals=[f'{i}:{v}' for i,v in enumerate(row) if v not in (None,'')]
-                  print('TARGET',label,ri,' || '.join(vals)[:8000]); hit+=1
-                  if hit>=6: break
+            r=sess.get(u,timeout=60); r.raise_for_status()
+            p=Path(f'out/{label}.xlsx'); p.write_bytes(r.content)
+            shas[label]=hashlib.sha256(r.content).hexdigest()
+            books[label]=openpyxl.load_workbook(p,data_only=True,read_only=True)
+            print('SOURCE',label,sid,len(r.content),shas[label],books[label].sheetnames)
+
+          def code5(v):
+            s=str(v or '').strip()
+            if s.endswith('.0'): s=s[:-2]
+            return s[:5] if len(s)>=5 and s[:5].isdigit() else None
+
+          def main_rows(wb):
+            ws=wb.worksheets[0]; out={}
+            for row in ws.iter_rows(values_only=True):
+              c=code5(row[0] if row else None)
+              if c in TARGETS:
+                if c in out: raise SystemExit(f'duplicate main row {c}')
+                out[c]={
+                  'population':float(row[5]),
+                  'households':float(row[6]),
+                  'population_change_rate':float(row[20]),
+                  'social_change_rate':float(row[24]),
+                }
+            return out
+
+          def age_rows(wb):
+            ws=wb.worksheets[0]; out={}
+            for row in ws.iter_rows(values_only=True):
+              c=code5(row[0] if row else None)
+              if c not in TARGETS: continue
+              sex=str(row[3] or '').strip()
+              if sex!='計': continue
+              if c in out: raise SystemExit(f'duplicate age total row {c}')
+              total=float(row[4]); a20=float(row[9]); a25=float(row[10])
+              out[c]={'total':total,'age20_29':a20+a25}
+            return out
+
+          m20=main_rows(books['2020_main']); a20=age_rows(books['2020_age'])
+          m21=main_rows(books['2021_main']); a21=age_rows(books['2021_age'])
+          expected=set(TARGETS)
+          for label,d in [('2020_main',m20),('2020_age',a20),('2021_main',m21),('2021_age',a21)]:
+            if set(d)!=expected: raise SystemExit(f'{label} coverage mismatch missing={sorted(expected-set(d))} extra={sorted(set(d)-expected)}')
+
+          rows=[]
+          for c in sorted(TARGETS):
+            hh0=m20[c]['households']; hh1=m21[c]['households']
+            age0=a20[c]['age20_29']; age1=a21[c]['age20_29']; pop1=a21[c]['total']
+            vals={
+              'population_change_rate_2020_pct':m21[c]['population_change_rate'],
+              'social_change_rate_2020_pct':m21[c]['social_change_rate'],
+              'household_growth_2020_to_2021_pct':(hh1/hh0-1.0)*100.0,
+              'age20_29_share_2021_pct':age1/pop1*100.0,
+              'age20_29_growth_2020_to_2021_pct':(age1/age0-1.0)*100.0,
+            }
+            if not all(math.isfinite(v) for v in vals.values()): raise SystemExit(f'nonfinite {c} {vals}')
+            rows.append({'region_code':c,'region_name':TARGETS[c],'metro':'Tokyo' if c.startswith('13') else 'Fukuoka',**vals})
+
+          outp=Path('out/demand_momentum_holdout_2022.csv')
+          fields=list(rows[0].keys())
+          with outp.open('w',encoding='utf-8',newline='') as f:
+            w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(rows)
+          csv_sha=hashlib.sha256(outp.read_bytes()).hexdigest()
+          meta={
+            'cutoff':'2022-03-31',
+            'regions':30,
+            'Tokyo':23,
+            'Fukuoka':7,
+            'source_statInfId':SOURCES,
+            'source_sha256':shas,
+            'features':fields[3:],
+            'csv_sha256':csv_sha,
+            'zero_fill':False,
+          }
+          Path('out/demand_momentum_holdout_2022_meta.json').write_text(json.dumps(meta,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('GATE regions=30 unique=30 complete_sources=4 no_missing=1 no_zero_fill=1')
+          print('CSV_SHA',csv_sha)
+          print('META',json.dumps(meta,ensure_ascii=False))
+          for r in rows: print('ROW',json.dumps(r,ensure_ascii=False))
           PY
           sha256sum out/*
-      - name: Upload Demand inspection
+      - name: Upload frozen Demand Momentum
         uses: actions/upload-artifact@v4
         with:
-          name: holdout-demand-inspection-2021
+          name: holdout-demand-freeze-2022
           path: out/
           if-no-files-found: error
           retention-days: 1
