@@ -1,4 +1,4 @@
-name: Diagnostic Holdout Physical Inspect FY2022 FY2023
+name: Diagnostic Holdout Physical Freeze FY2022 FY2023
 
 on:
   pull_request:
@@ -8,64 +8,115 @@ permissions:
   contents: read
 
 jobs:
-  inspect:
+  freeze:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Inspect official FY2022/FY2023 building-start workbooks
+      - name: Freeze 24-month Physical Execution for 30 regions
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet 'openpyxl==3.1.5' 'xlrd==2.0.1' 'requests==2.32.5'
+          python3 -m pip install --quiet 'xlrd==2.0.1' 'requests==2.32.5'
           mkdir -p out
           python3 - <<'PY'
-          import hashlib, requests
+          import csv, hashlib, json, re, requests, xlrd
           from pathlib import Path
-          import openpyxl, xlrd
+
           SOURCES={'FY2022':'000040052251','FY2023':'000040179628'}
-          s=requests.Session(); s.headers['User-Agent']='Mozilla/5.0'
+          TARGETS={
+            '13101':'千代田区','13102':'中央区','13103':'港区','13104':'新宿区','13105':'文京区','13106':'台東区','13107':'墨田区','13108':'江東区','13109':'品川区','13110':'目黒区','13111':'大田区','13112':'世田谷区','13113':'渋谷区','13114':'中野区','13115':'杉並区','13116':'豊島区','13117':'北区','13118':'荒川区','13119':'板橋区','13120':'練馬区','13121':'足立区','13122':'葛飾区','13123':'江戸川区',
+            '40131':'東区','40132':'博多区','40133':'中央区','40134':'南区','40135':'西区','40136':'城南区','40137':'早良区'}
+          CATS={'total':'全建築物計','J':'卸売業，小売業用建築物','L':'不動産業用建築物','M':'宿泊業，飲食サービス業用建築物','O':'医療，福祉用建築物'}
+          sess=requests.Session(); sess.headers['User-Agent']='Mozilla/5.0'
+          parts=[]; raw_meta={}; col_meta={}
+
+          def compact(s):
+            return re.sub(r'[\s　]+','',str(s or '')).replace('，',',').replace('・','・')
+
           for label,sid in SOURCES.items():
             u=f'https://www.e-stat.go.jp/stat-search/file-download?fileKind=0&statInfId={sid}'
-            r=s.get(u,timeout=60); r.raise_for_status(); b=r.content
-            sha=hashlib.sha256(b).hexdigest(); print('RAW',label,sid,len(b),b[:8],sha)
-            if b[:4]==b'PK\x03\x04':
-              p=Path(f'out/{label}.xlsx'); p.write_bytes(b)
-              wb=openpyxl.load_workbook(p,data_only=True,read_only=True)
-              print('FORMAT',label,'OOXML','SHEETS',[(ws.title,ws.max_row,ws.max_column) for ws in wb.worksheets])
-              for ws in wb.worksheets:
-                for ri,row in enumerate(ws.iter_rows(min_row=1,max_row=min(ws.max_row,18),values_only=True),1):
-                  vals=[f'{i}:{v}' for i,v in enumerate(row) if v not in (None,'')]
-                  if vals: print('HEAD',label,ws.title,ri,' || '.join(vals)[:9000])
-                hit=0
-                for ri,row in enumerate(ws.iter_rows(values_only=True),1):
-                  txt=' | '.join(str(v) for v in row if v not in (None,''))
-                  if '13101' in txt or '40131' in txt or '千代田区' in txt or '福岡市東区' in txt:
-                    vals=[f'{i}:{v}' for i,v in enumerate(row) if v not in (None,'')]
-                    print('TARGET',label,ws.title,ri,' || '.join(vals)[:12000]); hit+=1
-                    if hit>=8: break
-            elif b[:8]==bytes.fromhex('D0CF11E0A1B11AE1'):
-              p=Path(f'out/{label}.xls'); p.write_bytes(b)
-              wb=xlrd.open_workbook(file_contents=b)
-              print('FORMAT',label,'BIFF8/OLE','SHEETS',[(sh.name,sh.nrows,sh.ncols) for sh in wb.sheets()])
-              for sh in wb.sheets():
-                for ri in range(min(sh.nrows,18)):
-                  row=sh.row_values(ri); vals=[f'{i}:{v}' for i,v in enumerate(row) if v not in (None,'')]
-                  if vals: print('HEAD',label,sh.name,ri+1,' || '.join(vals)[:9000])
-                hit=0
-                for ri in range(sh.nrows):
-                  row=sh.row_values(ri); txt=' | '.join(str(v) for v in row if v not in (None,''))
-                  if '13101' in txt or '40131' in txt or '千代田区' in txt or '福岡市東区' in txt:
-                    vals=[f'{i}:{v}' for i,v in enumerate(row) if v not in (None,'')]
-                    print('TARGET',label,sh.name,ri+1,' || '.join(vals)[:12000]); hit+=1
-                    if hit>=8: break
-            else:
-              raise SystemExit(f'unknown workbook signature {label} {b[:16]!r}')
+            r=sess.get(u,timeout=60); r.raise_for_status(); b=r.content
+            if b[:8] != bytes.fromhex('D0CF11E0A1B11AE1'): raise SystemExit(f'{label} not expected BIFF8/OLE')
+            p=Path(f'out/{label}.xls'); p.write_bytes(b)
+            raw_sha=hashlib.sha256(b).hexdigest(); raw_meta[label]={'statInfId':sid,'sha256':raw_sha,'bytes':len(b)}
+            wb=xlrd.open_workbook(file_contents=b); sh=wb.sheet_by_name('B007')
+            header=sh.row_values(4); sub=sh.row_values(5)
+            starts=[]
+            for j,v in enumerate(header):
+              if str(v).strip(): starts.append((j,compact(v)))
+            target_cols={}
+            for key,title in CATS.items():
+              want=compact(title)
+              cand=[(j,t) for j,t in starts if want in t or (key!='total' and compact(key) and t.startswith(key))]
+              if len(cand)!=1: raise SystemExit(f'{label} category start {key} candidates={cand}')
+              j,_=cand[0]
+              next_starts=[x for x,t in starts if x>j]
+              end=min(next_starts) if next_starts else sh.ncols
+              floor=[k for k in range(j,end) if '床面積の合計' in compact(sub[k])]
+              if len(floor)!=1: raise SystemExit(f'{label} floor column {key} start={j} end={end} floor={floor}')
+              target_cols[key]=floor[0]
+            col_meta[label]=target_cols
+            print('COLUMNS',label,json.dumps(target_cols,ensure_ascii=False))
+
+            found={}
+            for i in range(sh.nrows):
+              cell=str(sh.cell_value(i,1)).strip()
+              m=re.match(r'^(\d{5})(.*)$',cell)
+              if not m: continue
+              code=m.group(1)
+              if code not in TARGETS: continue
+              if code in found: raise SystemExit(f'{label} duplicate target {code}')
+              vals={}
+              for key,col in target_cols.items():
+                v=sh.cell_value(i,col)
+                if isinstance(v,(int,float)):
+                  vals[key]=float(v)
+                else:
+                  s=str(v).strip()
+                  if s in ('','-','＊','*','X','x'): raise SystemExit(f'{label} suppressed/missing {code} {key}={v!r}')
+                  try: vals[key]=float(s.replace(',',''))
+                  except: raise SystemExit(f'{label} nonnumeric {code} {key}={v!r}')
+                if vals[key] < 0: raise SystemExit(f'{label} negative {code} {key}')
+              found[code]=vals
+              parts.append({'period':label,'region_code':code,'region_name':TARGETS[code],'metro':'Tokyo' if code.startswith('13') else 'Fukuoka',
+                            **{f'floor_area_{k}':vals[k] for k in CATS}})
+            if set(found)!=set(TARGETS): raise SystemExit(f'{label} coverage mismatch missing={sorted(set(TARGETS)-set(found))}')
+            print('GATE_PERIOD',label,'regions=30 unique=30 numeric_cells=150 missing=0 suppressed=0')
+
+          parts=sorted(parts,key=lambda r:(r['region_code'],r['period']))
+          agg=[]
+          for code in sorted(TARGETS):
+            rr=[r for r in parts if r['region_code']==code]
+            if len(rr)!=2: raise SystemExit(f'parts count {code} {len(rr)}')
+            row={'region_code':code,'region_name':TARGETS[code],'metro':'Tokyo' if code.startswith('13') else 'Fukuoka'}
+            for key in CATS:
+              total=sum(r[f'floor_area_{key}'] for r in rr)
+              if abs(total-round(total))<1e-9: total=int(round(total))
+              row[f'floor_area_{key}_h24']=total
+            agg.append(row)
+
+          part_path=Path('out/physical_execution_holdout_2022_parts.csv')
+          with part_path.open('w',encoding='utf-8',newline='') as f:
+            fields=list(parts[0].keys()); w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(parts)
+          agg_path=Path('out/physical_execution_holdout_2022_h24.csv')
+          with agg_path.open('w',encoding='utf-8',newline='') as f:
+            fields=list(agg[0].keys()); w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(agg)
+          meta={
+            'cutoff':'2022-03-31','answer_window':'2022-04-01..2024-03-31','regions':30,'Tokyo':23,'Fukuoka':7,
+            'periods':['FY2022','FY2023'],'sources':raw_meta,'floor_columns_zero_based':col_meta,
+            'categories':CATS,'parts_sha256':hashlib.sha256(part_path.read_bytes()).hexdigest(),
+            'aggregate_sha256':hashlib.sha256(agg_path.read_bytes()).hexdigest(),'zero_fill':False,
+          }
+          Path('out/physical_execution_holdout_2022_meta.json').write_text(json.dumps(meta,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('GATE_FINAL regions=30 periods=2 rows=60 numeric_cells=300 duplicate=0 missing=0 suppressed=0 zero_fill=0')
+          print('AGG_SHA',meta['aggregate_sha256']); print('PARTS_SHA',meta['parts_sha256']); print('META',json.dumps(meta,ensure_ascii=False))
+          for r in agg: print('ROW',json.dumps(r,ensure_ascii=False))
           PY
           sha256sum out/*
-      - name: Upload Physical inspection
+      - name: Upload frozen Physical Execution
         uses: actions/upload-artifact@v4
         with:
-          name: holdout-physical-inspection-fy2022-fy2023
+          name: holdout-physical-freeze-2022
           path: out/
           if-no-files-found: error
           retention-days: 1
