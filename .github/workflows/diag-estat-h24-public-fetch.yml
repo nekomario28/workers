@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - diag/estat-h24-public-fetch
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read
