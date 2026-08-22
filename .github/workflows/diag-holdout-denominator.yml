@@ -1,4 +1,4 @@
-name: Diagnostic Holdout Demand Inspect
+name: Diagnostic Holdout Demand Inspect 2021
 
 on:
   pull_request:
@@ -12,42 +12,40 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Inspect cutoff-safe resident-registry workbooks
+      - name: Inspect 2021 cutoff-safe resident-registry xlsx workbooks
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet 'xlrd==2.0.1' 'requests==2.32.5'
+          python3 -m pip install --quiet 'openpyxl==3.1.5' 'requests==2.32.5'
           mkdir -p out
           python3 - <<'PY'
           import requests,hashlib
           from pathlib import Path
-          import xlrd
-          specs=[('2020_main','000031971203'),('2020_age','000031971230'),('2021_main','000040306659'),('2021_age','000040306661')]
-          for label,sid in specs:
+          import openpyxl
+          for label,sid in [('2021_main','000040306659'),('2021_age','000040306661')]:
             u=f'https://www.e-stat.go.jp/stat-search/file-download?fileKind=0&statInfId={sid}'
-            r=requests.get(u,headers={'User-Agent':'Mozilla/5.0'},timeout=60); print('HTTP',label,r.status_code,len(r.content)); r.raise_for_status()
-            Path(f'out/{label}.xls').write_bytes(r.content)
-            print('SHA',label,hashlib.sha256(r.content).hexdigest(),r.content[:8])
-            wb=xlrd.open_workbook(file_contents=r.content)
-            print('SHEETS',label,[(s.name,s.nrows,s.ncols) for s in wb.sheets()])
-            for sh in wb.sheets():
-              for ri in range(min(sh.nrows,18)):
-                row=[sh.cell_value(ri,c) for c in range(sh.ncols)]
-                vals=[f'{i}:{v}' for i,v in enumerate(row) if v not in ('',None)]
-                if vals: print('HEAD',label,sh.name,ri,' || '.join(vals)[:7000])
+            r=requests.get(u,headers={'User-Agent':'Mozilla/5.0'},timeout=60); r.raise_for_status(); Path(f'out/{label}.xlsx').write_bytes(r.content)
+            print('SHA',label,hashlib.sha256(r.content).hexdigest())
+            wb=openpyxl.load_workbook(f'out/{label}.xlsx',data_only=True,read_only=True)
+            print('SHEETS',label,wb.sheetnames)
+            for ws in wb.worksheets:
+              print('SHEET',ws.title,ws.max_row,ws.max_column)
+              for ri,row in enumerate(ws.iter_rows(min_row=1,max_row=min(ws.max_row,18),values_only=True),start=1):
+                vals=[f'{i}:{v}' for i,v in enumerate(row) if v not in (None,'')]
+                if vals: print('HEAD',label,ri,' || '.join(vals)[:7000])
               hit=0
-              for ri in range(sh.nrows):
-                row=[sh.cell_value(ri,c) for c in range(sh.ncols)]
-                text=' | '.join(str(v) for v in row if v not in ('',None))
-                if ('13101' in text or '40131' in text) and hit<8:
-                  vals=[f'{i}:{v}' for i,v in enumerate(row) if v not in ('',None)]
-                  print('TARGET',label,sh.name,ri,' || '.join(vals)[:8000]); hit+=1
+              for ri,row in enumerate(ws.iter_rows(values_only=True),start=1):
+                code=str(row[0] or '')
+                if code.startswith('13101') or code.startswith('40131'):
+                  vals=[f'{i}:{v}' for i,v in enumerate(row) if v not in (None,'')]
+                  print('TARGET',label,ri,' || '.join(vals)[:8000]); hit+=1
+                  if hit>=6: break
           PY
           sha256sum out/*
       - name: Upload Demand inspection
         uses: actions/upload-artifact@v4
         with:
-          name: holdout-demand-inspection
+          name: holdout-demand-inspection-2021
           path: out/
           if-no-files-found: error
           retention-days: 1
