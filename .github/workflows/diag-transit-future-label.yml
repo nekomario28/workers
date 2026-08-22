@@ -35,16 +35,11 @@ jobs:
             pos=html.find(fname)
             print('INDEX',year,'FNAME_POS',pos)
             if pos<0: raise SystemExit(f'{fname} not listed in canonical index')
-            print('CONTEXT',year,repr(html[max(0,pos-1200):pos+1200]))
             candidates=[]
-            for m in re.finditer(r'''(?:https?://[^\"'<> ]+|/[^\"'<> ]+)''',html):
-              u=m.group(0).replace('&amp;','&')
-              if fname in u: candidates.append(requests.compat.urljoin(index,u))
-            candidates += [
-              f'https://nlftp.mlit.go.jp/ksj/gml/data/N02/N02-{code}/{fname}',
-              f'https://nlftp.mlit.go.jp/ksj/gml/data/N02/N02-{code}/N02-{code}_SHP.zip',
-              f'https://nlftp.mlit.go.jp/ksj/gml/data/N02/N02-{code}/N02-{code}_GEOJSON.zip',
-            ]
+            # Extract the canonical onclick relative path from the index when present.
+            for m in re.finditer(r"DownLd\([^)]*'([^']*%s)'" % re.escape(fname), html):
+              candidates.append(requests.compat.urljoin(index,m.group(1)))
+            candidates += [f'https://nlftp.mlit.go.jp/ksj/gml/data/N02/N02-{code}/{fname}']
             seen=[]
             for u in candidates:
               if u not in seen: seen.append(u)
@@ -60,22 +55,27 @@ jobs:
             z=zipfile.ZipFile(io.BytesIO(blob)); names=z.namelist()
             print('ZIP',year,zsha,len(names),names[:40])
             shp=[n for n in names if n.lower().endswith('.shp') and 'station' in n.lower()]
-            if not shp: shp=[n for n in names if n.lower().endswith('.shp') and ('n02-0' in n.lower() or 'station' in n.lower())]
-            station_count=None; fields=[]; samples=[]
+            station_count=None; fields=[]; samples=[]; station_file=None; encoding_used=None
             for candidate in shp:
               base=candidate[:-4]
               need={ext:next((n for n in names if n.lower()==(base+ext).lower()),None) for ext in ['.shp','.shx','.dbf']}
               if not all(need.values()): continue
-              rdr=shapefile.Reader(shp=io.BytesIO(z.read(need['.shp'])),shx=io.BytesIO(z.read(need['.shx'])),dbf=io.BytesIO(z.read(need['.dbf'])))
-              flds=[f[0] for f in rdr.fields[1:]]
-              if not any(x in flds for x in ['N02_005','N02_005c','N02_005g']): continue
-              fields=flds; station_count=len(rdr)
-              for sr in rdr.iterShapeRecords():
-                rec=dict(zip(fields,sr.record))
-                if len(samples)<5: samples.append(rec)
-              print('STATIONS',year,station_count,'SHP',candidate,'FIELDS',fields,'SAMPLES',json.dumps(samples,ensure_ascii=False)[:10000])
-              shp=[candidate]; break
-            summary.append({'year':year,'url':chosen,'zip_sha256':zsha,'station_shp':shp[0] if shp else None,'station_count':station_count,'fields':fields,'samples':samples})
+              last_err=None
+              for enc in (['cp932','shift_jis','utf-8'] if year<=2015 else ['utf-8','cp932']):
+                try:
+                  rdr=shapefile.Reader(shp=io.BytesIO(z.read(need['.shp'])),shx=io.BytesIO(z.read(need['.shx'])),dbf=io.BytesIO(z.read(need['.dbf'])),encoding=enc)
+                  flds=[f[0] for f in rdr.fields[1:]]
+                  if not any(x in flds for x in ['N02_005','N02_005c','N02_005g']): break
+                  sm=[]
+                  for idx,sr in enumerate(rdr.iterShapeRecords()):
+                    if idx<5: sm.append(dict(zip(flds,sr.record)))
+                  fields=flds; station_count=len(rdr); samples=sm; station_file=candidate; encoding_used=enc
+                  break
+                except UnicodeDecodeError as e: last_err=e; continue
+              if station_count is not None: break
+              if last_err: print('ENCODING_FAIL',year,candidate,repr(last_err))
+            print('STATIONS',year,station_count,'SHP',station_file,'ENC',encoding_used,'FIELDS',fields,'SAMPLES',json.dumps(samples,ensure_ascii=False)[:10000])
+            summary.append({'year':year,'url':chosen,'zip_sha256':zsha,'station_shp':station_file,'station_count':station_count,'encoding':encoding_used,'fields':fields,'samples':samples})
           assert all(x['station_count'] for x in summary), summary
           Path('out/summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
           PY
