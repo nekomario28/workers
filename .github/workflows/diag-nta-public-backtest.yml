@@ -1,0 +1,262 @@
+name: Diagnostic Neighborhood Pulse NTA Public Backtest
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  nta-backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: 2f80ef5cc9c4597dd1a80aa9e8aabb48733fb759
+      SOURCE_REPO: https://github.com/code4fukui/gBizINFO.git
+    steps:
+      - name: Materialize only cutoff-safe canonical NTA daily files
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/np-gbiz-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          REPO="$ROOT/repo"
+          mkdir -p "$ROOT"
+          git init -q "$REPO"
+          git -C "$REPO" remote add origin "$SOURCE_REPO"
+          git -C "$REPO" fetch --quiet --depth=1 --filter=blob:none origin "$SOURCE_SHA"
+          test "$(git -C "$REPO" rev-parse FETCH_HEAD)" = "$SOURCE_SHA"
+          git -C "$REPO" ls-tree -r --name-only FETCH_HEAD -- data > "$ROOT/all-paths.txt"
+          python3 - "$ROOT/all-paths.txt" "$ROOT/selected-paths.txt" <<'PY'
+          import re, sys
+          src, dst = sys.argv[1:]
+          pat = re.compile(r'^data/diff_(\d{8})_(created|terminated)\.csv$')
+          out = []
+          for line in open(src, encoding='utf-8'):
+              p = line.strip()
+              m = pat.match(p)
+              if m and '20220401' <= m.group(1) <= '20240331':
+                  out.append(p)
+          if not out:
+              raise SystemExit('no canonical files selected')
+          with open(dst, 'w', encoding='utf-8') as f:
+              f.write('\n'.join(out) + '\n')
+          created = sum(p.endswith('_created.csv') for p in out)
+          terminated = sum(p.endswith('_terminated.csv') for p in out)
+          print(f'selected_total={len(out)} created={created} terminated={terminated}')
+          if created < 450 or terminated < 450:
+              raise SystemExit('unexpectedly sparse canonical daily-file set')
+          PY
+          git -C "$REPO" sparse-checkout init --no-cone
+          git -C "$REPO" sparse-checkout set --no-cone --stdin < "$ROOT/selected-paths.txt"
+          git -C "$REPO" checkout --quiet --detach FETCH_HEAD
+          test "$(git -C "$REPO" rev-parse HEAD)" = "$SOURCE_SHA"
+          actual="$(find "$REPO/data" -maxdepth 1 -type f \( -name 'diff_*_created.csv' -o -name 'diff_*_terminated.csv' \) | wc -l)"
+          expected="$(wc -l < "$ROOT/selected-paths.txt")"
+          printf 'materialized_files=%s expected_files=%s\n' "$actual" "$expected"
+          test "$actual" -eq "$expected"
+          du -sh "$REPO/data"
+          printf 'NP_REPO=%s\n' "$REPO" >> "$GITHUB_ENV"
+
+      - name: Aggregate frozen 30-region Formation and terminal Exit
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          python3 - <<'PY'
+          import csv, glob, json, math, os, re, statistics
+          from collections import Counter, defaultdict
+          from datetime import date
+          from pathlib import Path
+
+          ROOT = Path(os.environ['NP_REPO'])
+          SOURCE_SHA = os.environ['SOURCE_SHA']
+          CUTOFF = date(2024, 3, 31)
+          CORE = {'301','302','303','304','305','株式会社','有限会社','合名会社','合資会社','合同会社'}
+          REGIONS = {
+              '13101':('千代田区','Tokyo',35990),'13102':('中央区','Tokyo',34126),
+              '13103':('港区','Tokyo',41049),'13104':('新宿区','Tokyo',33094),
+              '13105':('文京区','Tokyo',13761),'13106':('台東区','Tokyo',22881),
+              '13107':('墨田区','Tokyo',14895),'13108':('江東区','Tokyo',19443),
+              '13109':('品川区','Tokyo',19897),'13110':('目黒区','Tokyo',12275),
+              '13111':('大田区','Tokyo',28532),'13112':('世田谷区','Tokyo',27500),
+              '13113':('渋谷区','Tokyo',33284),'13114':('中野区','Tokyo',11962),
+              '13115':('杉並区','Tokyo',19274),'13116':('豊島区','Tokyo',19141),
+              '13117':('北区','Tokyo',11709),'13118':('荒川区','Tokyo',8346),
+              '13119':('板橋区','Tokyo',17238),'13120':('練馬区','Tokyo',20343),
+              '13121':('足立区','Tokyo',23123),'13122':('葛飾区','Tokyo',15600),
+              '13123':('江戸川区','Tokyo',19778),
+              '40131':('東区','Fukuoka',9319),'40132':('博多区','Fukuoka',22458),
+              '40133':('中央区','Fukuoka',18899),'40134':('南区','Fukuoka',8499),
+              '40135':('西区','Fukuoka',5696),'40136':('城南区','Fukuoka',3263),
+              '40137':('早良区','Fukuoka',6733),
+          }
+          assert len(REGIONS) == 30
+          assert sum(v[2] for k,v in REGIONS.items() if v[1]=='Tokyo') == 503241
+          assert sum(v[2] for k,v in REGIONS.items() if v[1]=='Fukuoka') == 74867
+          WINDOWS = {
+              'cur90':  (date(2024,1,2), date(2024,3,31)),
+              'prev90': (date(2023,1,1), date(2023,3,31)),
+              'cur365': (date(2023,4,2), date(2024,3,31)),
+              'prev365':(date(2022,4,1), date(2023,3,31)),
+          }
+          assert (WINDOWS['cur90'][1]-WINDOWS['cur90'][0]).days+1 == 90
+          assert (WINDOWS['prev90'][1]-WINDOWS['prev90'][0]).days+1 == 90
+          assert (WINDOWS['cur365'][1]-WINDOWS['cur365'][0]).days+1 == 365
+          assert (WINDOWS['prev365'][1]-WINDOWS['prev365'][0]).days+1 == 365
+
+          def dparse(s):
+              s=(s or '').strip()
+              if not s: return None
+              try: return date.fromisoformat(s[:10])
+              except ValueError: return None
+          def region(row):
+              p=(row.get('prefectureCode') or '').strip()
+              c=(row.get('cityCode') or '').strip()
+              return p.zfill(2)+c.zfill(3) if p and c else ''
+          def exact_zero(v): return (v or '').strip() == '0'
+          def is_new(v): return (v or '').strip() in {'01','新規'}
+          def is_close(v): return (v or '').strip() in {'21','登記記録の閉鎖等'}
+          def close_class(row):
+              proc=(row.get('process') or '').strip()
+              cause=(row.get('closeCause') or '').strip()
+              if not exact_zero(row.get('correct')): return 'correction'
+              if proc in {'81','商号の登記の抹消'}: return 'trade_name_erasure'
+              if proc in {'99','削除'}: return 'deletion'
+              if not is_close(proc): return 'other_process'
+              if cause in {'01','清算の結了等'}: return 'terminal'
+              if cause in {'11','合併による解散等'}: return 'merger'
+              if cause in {'21','登記官による閉鎖等'}: return 'registrar'
+              if cause in {'31','その他の清算の結了等'}: return 'other_liquidation'
+              return 'unknown_cause'
+          def filedate(fn):
+              m=re.search(r'diff_(\d{8})_', Path(fn).name)
+              return date(int(m.group(1)[:4]),int(m.group(1)[4:6]),int(m.group(1)[6:8])) if m else None
+
+          counts=defaultdict(Counter)
+          diagnostics=Counter(); closure_classes=Counter()
+          formation_seen=set(); exit_seen=set()
+          lag_form=[]; lag_exit=[]; file_lag_form=[]; file_lag_exit=[]
+          all_created=sorted(glob.glob(str(ROOT/'data/diff_*_created.csv')))
+          all_terminated=sorted(glob.glob(str(ROOT/'data/diff_*_terminated.csv')))
+          diagnostics['created_files']=len(all_created)
+          diagnostics['terminated_files']=len(all_terminated)
+          def bucket(kind, rc, d):
+              for wn,(lo,hi) in WINDOWS.items():
+                  if lo <= d <= hi: counts[rc][f'{kind}_{wn}'] += 1
+
+          for fn in all_created:
+              fd=filedate(fn)
+              with open(fn, encoding='utf-8-sig', newline='') as f:
+                  for row in csv.DictReader(f):
+                      diagnostics['created_rows'] += 1
+                      rc=region(row)
+                      if rc not in REGIONS: continue
+                      diagnostics['created_30region_rows'] += 1
+                      if (row.get('kind') or '').strip() not in CORE: continue
+                      diagnostics['created_core_rows'] += 1
+                      if not (is_new(row.get('process')) and exact_zero(row.get('correct'))):
+                          diagnostics['created_nonformation_core_rows'] += 1
+                          continue
+                      ch=dparse(row.get('changeDate')); up=dparse(row.get('updateDate'))
+                      if ch is None:
+                          diagnostics['formation_missing_changeDate'] += 1; continue
+                      if ch > CUTOFF:
+                          diagnostics['formation_future_changeDate'] += 1; continue
+                      key=((row.get('corporateNumber') or '').strip(), ch.isoformat())
+                      if key in formation_seen:
+                          diagnostics['formation_duplicates'] += 1; continue
+                      formation_seen.add(key); bucket('formation',rc,ch)
+                      if up:
+                          lag=(up-ch).days; lag_form.append(lag)
+                          if lag < 0: diagnostics['formation_negative_update_lag'] += 1
+                      if fd:
+                          lag=(fd-ch).days; file_lag_form.append(lag)
+                          if lag < 0: diagnostics['formation_negative_file_lag'] += 1
+
+          for fn in all_terminated:
+              fd=filedate(fn)
+              with open(fn, encoding='utf-8-sig', newline='') as f:
+                  for row in csv.DictReader(f):
+                      diagnostics['terminated_rows'] += 1
+                      rc=region(row)
+                      if rc not in REGIONS: continue
+                      diagnostics['terminated_30region_rows'] += 1
+                      if (row.get('kind') or '').strip() not in CORE: continue
+                      diagnostics['terminated_core_rows'] += 1
+                      cls=close_class(row); closure_classes[cls] += 1
+                      if cls != 'terminal': continue
+                      ch=dparse(row.get('changeDate')) or dparse(row.get('closeDate'))
+                      up=dparse(row.get('updateDate'))
+                      if ch is None:
+                          diagnostics['exit_missing_changeDate'] += 1; continue
+                      if ch > CUTOFF:
+                          diagnostics['exit_future_changeDate'] += 1; continue
+                      key=((row.get('corporateNumber') or '').strip(), (row.get('process') or '').strip(), ch.isoformat(), (row.get('closeCause') or '').strip())
+                      if key in exit_seen:
+                          diagnostics['exit_duplicates'] += 1; continue
+                      exit_seen.add(key); bucket('exit',rc,ch)
+                      if up:
+                          lag=(up-ch).days; lag_exit.append(lag)
+                          if lag < 0: diagnostics['exit_negative_update_lag'] += 1
+                      if fd:
+                          lag=(fd-ch).days; file_lag_exit.append(lag)
+                          if lag < 0: diagnostics['exit_negative_file_lag'] += 1
+
+          if diagnostics['formation_negative_file_lag'] or diagnostics['exit_negative_file_lag']:
+              raise SystemExit('canonical file date precedes event date for qualifying rows')
+
+          def ldiff(a,b): return math.log1p(a)-math.log1p(b)
+          rows=[]
+          for rc in sorted(REGIONS):
+              name,group,den=REGIONS[rc]; c=counts[rc]
+              rows.append({
+                  'region_code':rc,'region_name':name,'city_group':group,'establishments_2021_private':den,
+                  'formation_90d':c['formation_cur90'],'formation_prev90d':c['formation_prev90'],
+                  'formation_yoy_log':ldiff(c['formation_cur90'],c['formation_prev90']),
+                  'formation_per_1k_establishments':c['formation_cur90']/den*1000,
+                  'exit_90d':c['exit_cur90'],'exit_prev90d':c['exit_prev90'],
+                  'exit_yoy_log':ldiff(c['exit_cur90'],c['exit_prev90']),
+                  'exit_per_1k_establishments':c['exit_cur90']/den*1000,
+                  'formation_365d':c['formation_cur365'],'formation_prev365d':c['formation_prev365'],
+                  'formation_365d_yoy_log':ldiff(c['formation_cur365'],c['formation_prev365']),
+                  'exit_365d':c['exit_cur365'],'exit_prev365d':c['exit_prev365'],
+                  'exit_365d_yoy_log':ldiff(c['exit_cur365'],c['exit_prev365']),
+              })
+
+          def lagstats(vals):
+              if not vals: return None
+              x=sorted(vals)
+              def q(p): return x[min(len(x)-1, math.ceil(p*len(x))-1)]
+              return {'n':len(x),'min':x[0],'median':statistics.median(x),'p95':q(.95),'p99':q(.99),'max':x[-1]}
+          meta={
+              'source_repo':'code4fukui/gBizINFO','source_sha':SOURCE_SHA,'cutoff':'2024-03-31',
+              'scan_filename_window':['2022-04-01','2024-03-31'],
+              'event_windows':{k:[a.isoformat(),b.isoformat()] for k,(a,b) in WINDOWS.items()},
+              'diagnostics':dict(diagnostics),'closure_classes':dict(closure_classes),
+              'formation_update_lag_days':lagstats(lag_form),'terminal_exit_update_lag_days':lagstats(lag_exit),
+              'formation_file_lag_days':lagstats(file_lag_form),'terminal_exit_file_lag_days':lagstats(file_lag_exit),
+          }
+          fields=list(rows[0])
+          with open('out/nta_backtest.csv','w',encoding='utf-8',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(rows)
+          with open('out/nta_meta.json','w',encoding='utf-8') as f:
+              json.dump(meta,f,ensure_ascii=False,sort_keys=True,indent=2)
+          print('=== NP_BACKTEST_META ===')
+          print(json.dumps(meta,ensure_ascii=False,sort_keys=True))
+          print('=== NP_BACKTEST_TABLE ===')
+          print(','.join(fields))
+          for r in rows:
+              print(','.join(f'{r[f]:.9f}' if isinstance(r[f],float) else str(r[f]) for f in fields))
+          print('=== NP_BACKTEST_END ===')
+          PY
+          sha256sum out/nta_backtest.csv out/nta_meta.json
+
+      - name: Upload frozen NTA output
+        uses: actions/upload-artifact@v4
+        with:
+          name: neighborhood-pulse-nta-freeze
+          path: out/
+          if-no-files-found: error
+          retention-days: 1
