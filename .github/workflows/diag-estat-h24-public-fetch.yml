@@ -1,0 +1,41 @@
+name: Diagnostic e-Stat H24 Public Fetch
+
+on:
+  push:
+    branches:
+      - diag/estat-h24-public-fetch
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Fetch official e-Stat annual/fiscal workbooks
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p raw
+          curl --fail --location --retry 3 --retry-all-errors \
+            'https://www.e-stat.go.jp/stat-search/file-download?fileKind=0&statInfId=000040273624' \
+            -o raw/A_000040273624.xlsx
+          curl --fail --location --retry 3 --retry-all-errors \
+            'https://www.e-stat.go.jp/stat-search/file-download?fileKind=0&statInfId=000040273625' \
+            -o raw/B_000040273625.xlsx
+          curl --fail --location --retry 3 --retry-all-errors \
+            'https://www.e-stat.go.jp/stat-search/file-download?fileKind=0&statInfId=000040451288' \
+            -o raw/C_000040451288.xlsx
+          file raw/*
+          sha256sum raw/*
+          test -s raw/A_000040273624.xlsx
+          test -s raw/B_000040273625.xlsx
+          test -s raw/C_000040451288.xlsx
+      - name: Upload official source bytes
+        uses: actions/upload-artifact@v4
+        with:
+          name: estat-h24-official-source
+          path: raw/
+          if-no-files-found: error
+          retention-days: 1
