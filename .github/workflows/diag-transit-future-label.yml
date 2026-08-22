@@ -1,4 +1,4 @@
-name: Diagnostic Transit Future Topology Labels v2
+name: Diagnostic Transit Future N05 Relation Audit
 
 on:
   pull_request:
@@ -12,23 +12,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: Classify apparent additions using station-to-rail geometry
+      - name: Audit topology-v2 candidates against research-only N05 history
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet 'requests==2.32.5' 'pyshp==2.3.1' 'shapely==2.1.1' 'pyproj==3.7.2'
+          python3 -m pip install --quiet 'requests==2.32.5' 'pyshp==2.3.1'
           mkdir -p out
           python3 - <<'PY'
-          import csv, hashlib, io, json, math, requests, unicodedata, zipfile
-          from collections import defaultdict
+          import csv, hashlib, io, json, math, re, requests, unicodedata, zipfile
+          from collections import defaultdict, Counter
           from pathlib import Path
           import shapefile
-          from shapely.geometry import shape as make_shape
-          from shapely.ops import transform, unary_union
-          from pyproj import Transformer
 
-          YEARS=[2011,2015,2020,2025]; CODES={2011:'11',2015:'15',2020:'20',2025:'25'}
-          GROUP_M=300.0; SAME_NAME_M=500.0; RENAME_M=300.0; NEAR_PRIOR_M=300.0; RAIL_M=100.0
+          EXPECTED_CAND_SHA='1202090e0959a8460a2babc4593672b8474e24040ff70ea136662b26bf83c2d6'
+          CAND_URL='https://raw.githubusercontent.com/nekomario28/workers/diag/transit-future-label/tmp/transit_future_topology_labels_v2.csv'
+          N05_URL='https://nlftp.mlit.go.jp/ksj/gml/data/N05/N05-25/N05-25_GML.zip'
           s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0'})
           def norm(x): return ''.join(unicodedata.normalize('NFKC',str(x or '')).split())
           def hav(a,b):
@@ -36,131 +34,139 @@ jobs:
             p1=math.radians(lat1); p2=math.radians(lat2); dp=math.radians(lat2-lat1); dl=math.radians(lon2-lon1)
             q=math.sin(dp/2)**2+math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
             return 2*R*math.asin(min(1,math.sqrt(q)))
-          def rep(sh):
-            pts=sh.points; return (sum(p[1] for p in pts)/len(pts),sum(p[0] for p in pts)/len(pts))
-          def group(records):
-            n=len(records); parent=list(range(n))
-            def find(x):
-              while parent[x]!=x: parent[x]=parent[parent[x]]; x=parent[x]
-              return x
-            def union(a,b):
-              a=find(a); b=find(b)
-              if a!=b: parent[b]=a
-            by=defaultdict(list)
-            for i,r in enumerate(records): by[r['name_n']].append(i)
-            for ids in by.values():
-              for x in range(len(ids)):
-                for y in range(x+1,len(ids)):
-                  i,j=ids[x],ids[y]
-                  if hav(records[i]['pt'],records[j]['pt'])<=GROUP_M: union(i,j)
-            comp=defaultdict(list)
-            for i in range(n): comp[find(i)].append(i)
-            out=[]
-            for ids in comp.values():
-              rs=[records[i] for i in ids]
-              out.append({'name':rs[0]['name'],'name_n':rs[0]['name_n'],
-                'pt':(sum(r['pt'][0] for r in rs)/len(rs),sum(r['pt'][1] for r in rs)/len(rs)),
-                'tuples':sorted(set((r['op'],r['line']) for r in rs)),'members':len(rs),'geoms':[r['geom'] for r in rs]})
-            return out
-          def open_reader(z,names,kind):
-            fs=sorted([n for n in names if n.lower().endswith(f'_{kind.lower()}.shp')],key=lambda x:(0 if '/UTF-8/' in x else 1,x))
-            for shpname in fs:
-              base=shpname[:-4]; need={e:next((n for n in names if n.lower()==(base+e).lower()),None) for e in ['.shp','.shx','.dbf']}
-              if not all(need.values()): continue
-              for enc in (['utf-8','cp932'] if '/UTF-8/' in shpname else ['cp932','utf-8']):
-                try:
-                  rdr=shapefile.Reader(shp=io.BytesIO(z.read(need['.shp'])),shx=io.BytesIO(z.read(need['.shx'])),dbf=io.BytesIO(z.read(need['.dbf'])),encoding=enc)
-                  if len(rdr): _=rdr.record(0)
-                  return rdr,shpname,enc
-                except UnicodeDecodeError: pass
-            raise RuntimeError(f'cannot read {kind}')
-          def load(year):
-            code=CODES[year]; url=f'https://nlftp.mlit.go.jp/ksj/gml/data/N02/N02-{code}/N02-{code}_GML.zip'
-            for attempt in range(3):
+          def y(v):
+            m=re.search(r'(19\d{2}|20\d{2}|9999|999)',str(v or ''))
+            return int(m.group(1)) if m else None
+
+          cr=s.get(CAND_URL,timeout=30); cr.raise_for_status(); cb=cr.content
+          csha=hashlib.sha256(cb).hexdigest(); print('CANDIDATE_SHA',csha)
+          if csha!=EXPECTED_CAND_SHA: raise SystemExit(f'candidate provenance mismatch {csha}')
+          Path('out/topology_labels_v2.csv').write_bytes(cb)
+          candidates=list(csv.DictReader(io.StringIO(cb.decode('utf-8'))))
+          print('CANDIDATES',len(candidates),Counter((r['from_year'],r['to_year']) for r in candidates))
+          if len(candidates)!=195: raise SystemExit('expected 195 topology-v2 candidates')
+
+          blob=None
+          for attempt in range(4):
+            try:
+              rr=s.get(N05_URL,timeout=120); rr.raise_for_status()
+              if rr.content[:2]!=b'PK': raise RuntimeError('N05 response is not ZIP')
+              blob=rr.content; break
+            except Exception as e:
+              print('N05_FETCH_RETRY',attempt+1,repr(e))
+              if attempt==3: raise
+          n05sha=hashlib.sha256(blob).hexdigest(); Path('out/N05-25_GML.zip').write_bytes(blob)
+          z=zipfile.ZipFile(io.BytesIO(blob)); names=z.namelist()
+          print('N05_ZIP',len(blob),n05sha,'FILES',len(names),names[:80])
+          station_files=sorted([n for n in names if n.lower().endswith('station2.shp')],key=lambda n:(0 if '/UTF-8/' in n else 1,n))
+          if not station_files: raise SystemExit('Station2.shp not found')
+          rdr=None; used=None
+          for shpname in station_files:
+            base=shpname[:-4]
+            need={e:next((n for n in names if n.lower()==(base+e).lower()),None) for e in ['.shp','.shx','.dbf']}
+            if not all(need.values()): continue
+            for enc in (['utf-8','cp932'] if '/UTF-8/' in shpname else ['cp932','utf-8']):
               try:
-                rr=s.get(url,timeout=90); rr.raise_for_status(); blob=rr.content; break
-              except Exception:
-                if attempt==2: raise
-            sha=hashlib.sha256(blob).hexdigest(); z=zipfile.ZipFile(io.BytesIO(blob)); names=z.namelist()
-            sr,sfile,senc=open_reader(z,names,'Station'); sf=[f[0] for f in sr.fields[1:]]; stations=[]
-            for x in sr.iterShapeRecords():
-              d=dict(zip(sf,x.record)); stations.append({'name':str(d.get('N02_005','')),'name_n':norm(d.get('N02_005')),'op':norm(d.get('N02_004')),'line':norm(d.get('N02_003')),'pt':rep(x.shape),'geom':make_shape(x.shape.__geo_interface__)})
-            rrdr,rfile,renc=open_reader(z,names,'RailroadSection'); rf=[f[0] for f in rrdr.fields[1:]]; rails=[]
-            for x in rrdr.iterShapeRecords():
-              d=dict(zip(rf,x.record)); pts=x.shape.points
-              if not pts: continue
-              lons=[p[0] for p in pts]; lats=[p[1] for p in pts]
-              rails.append({'tuple':(norm(d.get('N02_004')),norm(d.get('N02_003'))),'geom':make_shape(x.shape.__geo_interface__),'bbox':(min(lats),max(lats),min(lons),max(lons))})
-            gs=group(stations)
-            print('SNAP',year,'station_rows',len(stations),'physical',len(gs),'rails',len(rails),'sha',sha,'files',sfile,senc,rfile,renc)
-            return {'groups':gs,'rails':rails,'rail_tuples':set(r['tuple'] for r in rails),'sha':sha}
-          snaps={y:load(y) for y in YEARS}
-          def temporal(a,b):
-            A=snaps[a]['groups']; B=snaps[b]['groups']; ua=set(range(len(A))); ub=set(range(len(B)))
-            ca=defaultdict(list); cb=defaultdict(list); namesB=defaultdict(list)
-            for j in ub: namesB[B[j]['name_n']].append(j)
-            for i in ua:
-              for j in namesB[A[i]['name_n']]:
-                d=hav(A[i]['pt'],B[j]['pt'])
-                if d<=SAME_NAME_M: ca[i].append((j,d)); cb[j].append((i,d))
-            for i,v in list(ca.items()):
-              if len(v)==1 and len(cb[v[0][0]])==1: ua.discard(i); ub.discard(v[0][0])
-            ca=defaultdict(list); cb=defaultdict(list)
-            for i in ua:
-              ta=set(A[i]['tuples'])
-              for j in ub:
-                if ta.intersection(B[j]['tuples']):
-                  d=hav(A[i]['pt'],B[j]['pt'])
-                  if d<=RENAME_M: ca[i].append((j,d)); cb[j].append((i,d))
-            pairs=[]
-            for i,v in ca.items():
-              if len(v)==1 and len(cb[v[0][0]])==1: pairs.append((v[0][1],i,v[0][0]))
-            for d,i,j in sorted(pairs):
-              if i in ua and j in ub: ua.remove(i); ub.remove(j)
-            return A,B,sorted(ua),sorted(ub)
-          def nearest_station(pt,A): return min((hav(pt,g['pt']) for g in A),default=1e30)
-          def topology_distances(g,rails):
-            lat,lon=g['pt']; zone=int((lon+180)//6)+1; epsg=32600+zone if lat>=0 else 32700+zone
-            tr=Transformer.from_crs(4326,epsg,always_xy=True)
-            station_metric=transform(tr.transform,unary_union(g['geoms']))
-            future_t=set(g['tuples']); same=1e30; anyr=1e30
-            for r in rails:
-              mnla,mxla,mnlo,mxlo=r['bbox']
-              if lat<mnla-0.01 or lat>mxla+0.01 or lon<mnlo-0.012 or lon>mxlo+0.012: continue
-              d=station_metric.distance(transform(tr.transform,r['geom']))
-              if d<anyr: anyr=d
-              if r['tuple'] in future_t and d<same: same=d
-            return same,anyr
-          rows=[]; counts={}; sanity={}
-          for a,b in zip(YEARS,YEARS[1:]):
-            A,B,rem,add=temporal(a,b); cc=defaultdict(int)
-            for j in add:
-              g=B[j]; ns=nearest_station(g['pt'],A); near=ns<=NEAR_PRIOR_M
-              future_t=set(g['tuples']); same,anyr=topology_distances(g,snaps[a]['rails'])
-              if same<=RAIL_M: cls='existing_line_infill_candidate'
-              elif anyr<=RAIL_M: cls='existing_geometry_recode_suspect'
-              elif future_t.intersection(snaps[a]['rail_tuples']): cls='extension_candidate'
-              else: cls='new_line_candidate'
-              cc[cls]+=1
-              rows.append([a,b,g['name'],cls,near,round(ns,2),round(same,2) if same<1e29 else '',round(anyr,2) if anyr<1e29 else '',g['pt'][0],g['pt'][1],g['members'],';'.join('/'.join(t) for t in g['tuples'])])
-              if (a,b)==(2015,2020) and g['name'] in ('高輪ゲートウェイ','梅小路京都西'): sanity[g['name']]=cls
-              if (a,b)==(2020,2025) and g['name']=='新綱島': sanity[g['name']]=cls
-            counts[f'{a}->{b}']=dict(cc); print('CLASS',a,b,dict(cc))
-          with open('out/topology_labels_v2.csv','w',encoding='utf-8',newline='') as f:
-            w=csv.writer(f); w.writerow(['from_year','to_year','future_station','class','near_prior_station_300m','nearest_prior_station_m','station_geom_to_same_line_cutoff_rail_m','station_geom_to_any_cutoff_rail_m','lat','lon','members','future_operator_lines']); w.writerows(rows)
-          expected={'高輪ゲートウェイ':'existing_line_infill_candidate','梅小路京都西':'existing_line_infill_candidate','新綱島':'new_line_candidate'}
-          bad={k:(sanity.get(k),v) for k,v in expected.items() if sanity.get(k)!=v}
-          summary={'rules':{'group_m':GROUP_M,'same_name_m':SAME_NAME_M,'rename_m':RENAME_M,'near_prior_m_diagnostic':NEAR_PRIOR_M,'rail_m':RAIL_M,'topology_distance':'station_geometry_to_rail_geometry_UTM'},'counts':counts,'sanity':sanity,'raw_sha256':{str(y):snaps[y]['sha'] for y in YEARS}}
-          Path('out/topology_summary_v2.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
-          print('SANITY',json.dumps(sanity,ensure_ascii=False)); print('SUMMARY',json.dumps(summary,ensure_ascii=False))
-          if bad: raise SystemExit('TOPOLOGY_V2_SANITY_FAIL '+json.dumps(bad,ensure_ascii=False))
+                x=shapefile.Reader(shp=io.BytesIO(z.read(need['.shp'])),shx=io.BytesIO(z.read(need['.shx'])),dbf=io.BytesIO(z.read(need['.dbf'])),encoding=enc)
+                if len(x): _=x.record(0)
+                rdr=x; used=(shpname,enc); break
+              except UnicodeDecodeError: continue
+            if rdr is not None: break
+          if rdr is None: raise SystemExit('cannot decode Station2')
+          fields=[f[0] for f in rdr.fields[1:]]
+          required={'N05_002','N05_003','N05_005b','N05_005e','N05_006','N05_011'}
+          if not required.issubset(fields): raise SystemExit('missing N05 fields '+repr(sorted(required-set(fields))))
+          print('N05_STATION_SOURCE',used,'ROWS',len(rdr),'FIELDS',fields)
+
+          records=[]; byrel=defaultdict(list); byname=defaultdict(list)
+          for idx,sr in enumerate(rdr.iterShapeRecords()):
+            d=dict(zip(fields,sr.record)); pts=sr.shape.points
+            if not pts: continue
+            pt=(pts[0][1],pts[0][0])
+            rec={'idx':idx,'name':str(d.get('N05_011','')),'name_n':norm(d.get('N05_011')),
+                 'line':str(d.get('N05_002','')),'op':str(d.get('N05_003','')),
+                 'line_n':norm(d.get('N05_002')),'op_n':norm(d.get('N05_003')),
+                 'start':y(d.get('N05_005b')),'end':y(d.get('N05_005e')),'rel':str(d.get('N05_006','')),'pt':pt}
+            records.append(rec); byrel[rec['rel']].append(rec); byname[rec['name_n']].append(rec)
+          relmeta={}
+          for rel,rs in byrel.items():
+            starts=[r['start'] for r in rs if r['start'] not in (None,999,9999)]
+            relmeta[rel]={'first_start':min(starts) if starts else None,'names':sorted(set(r['name'] for r in rs)),
+                          'lines':sorted(set(r['line'] for r in rs)),'ops':sorted(set(r['op'] for r in rs))}
+          print('N05_RELATIONS',len(relmeta),'STATION_RECORDS',len(records))
+
+          out=[]; class_counts=defaultdict(Counter); exact_match=0; fallback_match=0
+          for c in candidates:
+            fy=int(c['from_year']); ty=int(c['to_year']); name=c['future_station']; nn=norm(name); pt=(float(c['lat']),float(c['lon']))
+            same=[]
+            for r in byname.get(nn,[]):
+              d=hav(pt,r['pt'])
+              if d<=500: same.append((d,r))
+            mode='same_name_500m'; matched=same
+            if not matched:
+              near=[]
+              # conservative geometry-only fallback for current-name representation anomalies
+              for r in records:
+                if abs(r['pt'][0]-pt[0])>0.002 or abs(r['pt'][1]-pt[1])>0.003: continue
+                d=hav(pt,r['pt'])
+                if d<=100: near.append((d,r))
+              matched=near; mode='geometry_100m_fallback'
+            if matched:
+              if mode.startswith('same'): exact_match+=1
+              else: fallback_match+=1
+              # only relations represented by nearest candidate-name/geometry records; relation history then supplies old names.
+              mind=min(d for d,r in matched)
+              rels=sorted(set(r['rel'] for d,r in matched if d<=mind+30.0))
+              metas=[relmeta.get(rel,{}) for rel in rels]
+              firsts=[m.get('first_start') for m in metas if m.get('first_start') not in (None,999,9999)]
+              any_pre=any(v<=fy for v in firsts)
+              any_new=any(fy<v<=ty for v in firsts)
+              if any_pre and any_new: audit='mixed_old_and_new_relations'
+              elif any_pre: audit='preexisting_relation'
+              elif any_new: audit='new_relation_in_interval'
+              elif firsts and all(v>ty for v in firsts): audit='relation_starts_after_target'
+              else: audit='relation_start_unknown'
+              hist_names=sorted(set(n for m in metas for n in m.get('names',[])))
+              hist_lines=sorted(set(n for m in metas for n in m.get('lines',[])))
+              hist_ops=sorted(set(n for m in metas for n in m.get('ops',[])))
+              first=min(firsts) if firsts else None
+              nearest=round(mind,2)
+            else:
+              rels=[]; first=None; audit='no_n05_match'; hist_names=[]; hist_lines=[]; hist_ops=[]; nearest=None
+            class_counts[c['class']][audit]+=1
+            out.append({**c,'n05_match_mode':mode if matched else 'none','n05_nearest_m':nearest,'n05_relation_ids':';'.join(rels),
+                        'n05_first_start':first,'n05_audit':audit,'n05_history_names':' | '.join(hist_names),
+                        'n05_history_lines':' | '.join(hist_lines),'n05_history_operators':' | '.join(hist_ops)})
+          cols=list(candidates[0].keys())+['n05_match_mode','n05_nearest_m','n05_relation_ids','n05_first_start','n05_audit','n05_history_names','n05_history_lines','n05_history_operators']
+          with open('out/n05_relation_audit.csv','w',encoding='utf-8',newline='') as f:
+            w=csv.DictWriter(f,fieldnames=cols); w.writeheader(); w.writerows(out)
+          summary={'candidate_sha256':csha,'n05_raw_sha256':n05sha,'n05_source':used,'candidate_rows':len(candidates),
+                   'same_name_matches':exact_match,'geometry_fallback_matches':fallback_match,
+                   'class_audit_counts':{k:dict(v) for k,v in class_counts.items()}}
+          # Fixed sanity: known renames should have pre-cutoff relation history; known true additions should begin in interval.
+          lookup={(r['from_year'],r['to_year'],r['future_station']):r for r in out}
+          checks={
+            '大阪梅田': lookup.get(('2015','2020','大阪梅田'),{}).get('n05_audit'),
+            '羽田空港第3ターミナル': lookup.get(('2015','2020','羽田空港第3ターミナル'),{}).get('n05_audit'),
+            '高輪ゲートウェイ': lookup.get(('2015','2020','高輪ゲートウェイ'),{}).get('n05_audit'),
+            '梅小路京都西': lookup.get(('2015','2020','梅小路京都西'),{}).get('n05_audit'),
+            '新綱島': lookup.get(('2020','2025','新綱島'),{}).get('n05_audit'),
+          }
+          summary['sanity']=checks
+          Path('out/n05_relation_audit_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('CLASS_AUDIT',json.dumps(summary['class_audit_counts'],ensure_ascii=False))
+          print('SANITY',json.dumps(checks,ensure_ascii=False))
+          print('SUMMARY',json.dumps(summary,ensure_ascii=False))
+          expected={'大阪梅田':'preexisting_relation','羽田空港第3ターミナル':'preexisting_relation','高輪ゲートウェイ':'new_relation_in_interval','梅小路京都西':'new_relation_in_interval','新綱島':'new_relation_in_interval'}
+          bad={k:(checks.get(k),v) for k,v in expected.items() if checks.get(k)!=v}
+          if bad: raise SystemExit('N05_AUDIT_SANITY_FAIL '+json.dumps(bad,ensure_ascii=False))
           PY
           sha256sum out/*
-      - name: Upload topology v2 audit
+      - name: Upload N05 relation audit
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: transit-future-topology-label-audit-v2
+          name: transit-future-n05-relation-audit
           path: out/
           if-no-files-found: warn
           retention-days: 1
