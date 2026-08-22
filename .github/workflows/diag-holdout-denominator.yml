@@ -8,44 +8,66 @@ permissions:
   contents: read
 
 jobs:
-  inspect:
+  freeze:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Inspect official 2016 Economic Census table 1
+      - name: Freeze official 2016 Economic Census denominator for 30 regions
         shell: bash
         run: |
           set -euo pipefail
           python3 -m pip install --quiet 'xlrd==2.0.1' 'requests==2.32.5'
           mkdir -p out
           python3 - <<'PY'
-          import csv, hashlib, re, requests, xlrd
+          import csv, hashlib, requests, xlrd
           from pathlib import Path
           url='https://www.e-stat.go.jp/stat-search/file-download?statInfId=000031768938&fileKind=0'
-          r=requests.get(url,headers={'User-Agent':'Mozilla/5.0'},timeout=60); r.raise_for_status()
-          Path('out/table1.xls').write_bytes(r.content)
-          print('RAW',len(r.content),hashlib.sha256(r.content).hexdigest())
-          wb=xlrd.open_workbook(file_contents=r.content)
-          print('SHEETS',[(s.name,s.nrows,s.ncols) for s in wb.sheets()])
-          targets=['千代田区','中央区','港区','新宿区','文京区','台東区','墨田区','江東区','品川区','目黒区','大田区','世田谷区','渋谷区','中野区','杉並区','豊島区','北区','荒川区','板橋区','練馬区','足立区','葛飾区','江戸川区','福岡市東区','福岡市博多区','福岡市中央区','福岡市南区','福岡市西区','福岡市城南区','福岡市早良区']
-          with open('out/matches.tsv','w',encoding='utf-8',newline='') as f:
-            w=csv.writer(f,delimiter='\t'); w.writerow(['sheet','row','cells'])
-            for sh in wb.sheets():
-              for i in range(sh.nrows):
-                vals=[sh.cell_value(i,j) for j in range(sh.ncols)]
-                text=' | '.join(str(v) for v in vals)
-                if any(t in text for t in targets):
-                  compact=[]
-                  for j,v in enumerate(vals):
-                    if v not in ('',None): compact.append(f'{j}:{v}')
-                  w.writerow([sh.name,i,' || '.join(compact)])
-                  print('MATCH',sh.name,i,' || '.join(compact)[:3000])
+          b=requests.get(url,headers={'User-Agent':'Mozilla/5.0'},timeout=60).content
+          Path('out/table1.xls').write_bytes(b)
+          raw_sha=hashlib.sha256(b).hexdigest()
+          wb=xlrd.open_workbook(file_contents=b); sh=wb.sheet_by_index(0)
+          targets={
+            '東京都': {f'{i:03d}':f'13{i:03d}' for i in range(101,124)},
+            '福岡市': {f'{i:03d}':f'40{i:03d}' for i in range(131,138)},
+          }
+          names={
+            '13101':'千代田区','13102':'中央区','13103':'港区','13104':'新宿区','13105':'文京区','13106':'台東区','13107':'墨田区','13108':'江東区','13109':'品川区','13110':'目黒区','13111':'大田区','13112':'世田谷区','13113':'渋谷区','13114':'中野区','13115':'杉並区','13116':'豊島区','13117':'北区','13118':'荒川区','13119':'板橋区','13120':'練馬区','13121':'足立区','13122':'葛飾区','13123':'江戸川区',
+            '40131':'東区','40132':'博多区','40133':'中央区','40134':'南区','40135':'西区','40136':'城南区','40137':'早良区'}
+          rows=[]; context=None
+          for i in range(sh.nrows):
+            region=str(sh.cell_value(i,3)).strip()
+            if region in targets: context=region; continue
+            if context:
+              suffix=str(sh.cell_value(i,2)).strip()
+              if suffix.endswith('.0'): suffix=suffix[:-2]
+              suffix=suffix.zfill(3)
+              if suffix in targets[context]:
+                code=targets[context][suffix]
+                val=sh.cell_value(i,6)
+                rows.append((code,names[code], 'Tokyo' if code.startswith('13') else 'Fukuoka', int(val), i))
+                if len([x for x in rows if x[2]==('Tokyo' if context=='東京都' else 'Fukuoka')]) == len(targets[context]):
+                  context=None
+          rows=sorted(rows)
+          codes=[r[0] for r in rows]
+          expected=sorted(names)
+          assert codes==expected, (len(rows), set(expected)-set(codes), set(codes)-set(expected))
+          assert len(codes)==len(set(codes))==30
+          assert all(r[3]>0 for r in rows)
+          out='out/establishments_2016_30regions.csv'
+          with open(out,'w',encoding='utf-8',newline='') as f:
+            w=csv.writer(f); w.writerow(['region_code','region_name','metro','private_establishments_2016','source_stat_infid','source_raw_sha256','source_row'])
+            for code,name,metro,val,row in rows: w.writerow([code,name,metro,val,'000031768938',raw_sha,row])
+          csv_sha=hashlib.sha256(Path(out).read_bytes()).hexdigest()
+          print('GATE regions=30 unique=30 positive=30 Tokyo=23 Fukuoka=7')
+          print('RAW_SHA',raw_sha)
+          print('CSV_SHA',csv_sha)
+          for r in rows: print('ROW',*r)
           PY
           sha256sum out/*
-      - name: Upload inspection
+      - name: Upload frozen denominator
         uses: actions/upload-artifact@v4
         with:
-          name: holdout-denominator-inspection
+          name: holdout-denominator-freeze
           path: out/
           if-no-files-found: error
           retention-days: 1
