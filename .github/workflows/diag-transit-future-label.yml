@@ -1,4 +1,4 @@
-name: Diagnostic Transit Future N02 Longitudinal Memory
+name: Diagnostic Transit Future N02 Historical Service Identity
 
 on:
   pull_request:
@@ -13,14 +13,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Build commercial-safe N02 longitudinal station memory
+      - name: Check same-name same-service history before cutoff
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           python3 -m pip install --quiet 'requests==2.32.5' 'beautifulsoup4==4.13.4' 'pyshp==2.3.1'
-          mkdir -p input out snapshots
+          mkdir -p input out
           curl --fail --location --silent --show-error \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H 'Accept: application/vnd.github+json' \
@@ -33,58 +33,15 @@ jobs:
           from collections import defaultdict, Counter
           from concurrent.futures import ThreadPoolExecutor, as_completed
           from pathlib import Path
-          from urllib.parse import urljoin
-          from bs4 import BeautifulSoup
           import shapefile
 
           CANONICAL_SHA='1202090e0959a8460a2babc4593672b8474e24040ff70ea136662b26bf83c2d6'
-          YEARS=[2005,2006,2007,2008]+list(range(2011,2026))
+          YEARS=[2005,2006,2007,2008]+list(range(2011,2021))
           cb=Path('input/topology_labels_v2.csv').read_bytes(); csha=hashlib.sha256(cb).hexdigest()
-          print('CANDIDATE_SHA',csha)
           if csha!=CANONICAL_SHA: raise SystemExit(f'canonical artifact mismatch {csha}')
           candidates=list(csv.DictReader(io.StringIO(cb.decode('utf-8'))))
           if len(candidates)!=195: raise SystemExit(f'expected 195 candidates, got {len(candidates)}')
           Path('out/topology_labels_v2.csv').write_bytes(cb)
-
-          sess=requests.Session(); sess.headers['User-Agent']='Mozilla/5.0'
-          index='https://nlftp.mlit.go.jp/ksj/gml/datalist/KsjTmplt-N02-2025.html'
-          r=sess.get(index,timeout=60); r.raise_for_status(); soup=BeautifulSoup(r.text,'html.parser')
-          links={}
-          for a in soup.find_all('a',href=True):
-            u=urljoin(r.url,a['href']); text=' '.join(a.stripped_strings)
-            blob=' '.join([u,text])
-            m=re.search(r'N02-(\d{2})(?:_GML)?\.zip',blob,re.I)
-            if m:
-              yy=int(m.group(1)); year=2000+yy
-              if year in YEARS: links[year]=u
-          # Current index can hide hrefs behind JS. Fall back to official stable path pattern, then validate ZIP signature.
-          for year in YEARS:
-            yy=year%100
-            links.setdefault(year,f'https://nlftp.mlit.go.jp/ksj/gml/data/N02/N02-{yy:02d}/N02-{yy:02d}_GML.zip')
-          print('INDEX_LINKS',len(links),sorted(links))
-
-          def fetch_one(year):
-            urls=[links[year]]
-            yy=year%100
-            if year==2013: urls += [f'https://nlftp.mlit.go.jp/ksj/gml/data/N02/N02-{yy:02d}/N02-{yy:02d}.zip']
-            last=None
-            for u in urls:
-              try:
-                rr=requests.get(u,headers={'User-Agent':'Mozilla/5.0'},timeout=120)
-                if rr.status_code==200 and rr.content[:2]==b'PK':
-                  return year,u,rr.content
-                last=f'{rr.status_code} {rr.content[:20]!r}'
-              except Exception as e: last=repr(e)
-            raise RuntimeError(f'{year} download failed {last} urls={urls}')
-
-          blobs={}; urls_used={}; shas={}
-          with ThreadPoolExecutor(max_workers=4) as ex:
-            futs={ex.submit(fetch_one,y):y for y in YEARS}
-            for fut in as_completed(futs):
-              y,u,b=fut.result(); blobs[y]=b; urls_used[y]=u; shas[y]=hashlib.sha256(b).hexdigest()
-              Path(f'snapshots/N02-{y%100:02d}.zip').write_bytes(b)
-              print('FETCH',y,len(b),shas[y],u)
-          if set(blobs)!=set(YEARS): raise SystemExit('snapshot coverage incomplete')
 
           def norm(x): return ''.join(unicodedata.normalize('NFKC',str(x or '')).split())
           def hav(a,b):
@@ -93,119 +50,110 @@ jobs:
             q=math.sin(dp/2)**2+math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
             return 2*R*math.asin(min(1,math.sqrt(q)))
           def center(points):
-            if not points: return None
-            # Station geometry is line-like in N02. BBox midpoint is stable across vertex densification.
             xs=[p[0] for p in points]; ys=[p[1] for p in points]
-            return ((min(ys)+max(ys))/2,(min(xs)+max(xs))/2)
+            return ((min(ys)+max(ys))/2,(min(xs)+max(xs))/2) if points else None
+          def urls_for(y):
+            yy=y%100
+            x=[f'https://nlftp.mlit.go.jp/ksj/gml/data/N02/N02-{yy:02d}/N02-{yy:02d}_GML.zip']
+            if y==2013: x.insert(0,f'https://nlftp.mlit.go.jp/ksj/gml/data/N02/N02-{yy:02d}/N02-{yy:02d}.zip')
+            return x
+          def fetch(y):
+            last=None
+            for u in urls_for(y):
+              try:
+                r=requests.get(u,headers={'User-Agent':'Mozilla/5.0'},timeout=120)
+                if r.status_code==200 and r.content[:2]==b'PK': return y,u,r.content
+                last=f'{r.status_code} {r.content[:16]!r}'
+              except Exception as e: last=repr(e)
+            raise RuntimeError(f'{y} {last}')
 
-          snapshots={}; parse_meta={}
-          for year in YEARS:
-            z=zipfile.ZipFile(io.BytesIO(blobs[year])); names=z.namelist()
-            station_files=[n for n in names if n.lower().endswith('station.shp')]
-            if not station_files:
-              station_files=[n for n in names if 'station' in n.lower() and n.lower().endswith('.shp')]
-            if not station_files: raise SystemExit(f'no Station shapefile {year}: {names[:30]}')
-            # Prefer UTF-8 path if present, otherwise first station shp.
-            station_files=sorted(station_files,key=lambda n:(0 if '/UTF-8/' in n else 1,n))
+          blobs={}; shas={}; urls={}
+          with ThreadPoolExecutor(max_workers=4) as ex:
+            futs={ex.submit(fetch,y):y for y in YEARS}
+            for fut in as_completed(futs):
+              y,u,b=fut.result(); blobs[y]=b; urls[y]=u; shas[y]=hashlib.sha256(b).hexdigest(); print('FETCH',y,len(b),shas[y])
+          if set(blobs)!=set(YEARS): raise SystemExit('snapshot coverage incomplete')
+
+          hist={}; parse={}
+          for y in YEARS:
+            z=zipfile.ZipFile(io.BytesIO(blobs[y])); names=z.namelist()
+            station_files=sorted([n for n in names if n.lower().endswith('station.shp')],key=lambda n:(0 if '/UTF-8/' in n else 1,n))
+            if not station_files: station_files=sorted([n for n in names if 'station' in n.lower() and n.lower().endswith('.shp')])
             rdr=None; used=None
-            for shpname in station_files:
-              base=shpname[:-4]
-              need={e:next((n for n in names if n.lower()==(base+e).lower()),None) for e in ['.shp','.shx','.dbf']}
+            for shp in station_files:
+              base=shp[:-4]; need={e:next((n for n in names if n.lower()==(base+e).lower()),None) for e in ['.shp','.shx','.dbf']}
               if not all(need.values()): continue
-              for enc in (['utf-8','cp932'] if '/UTF-8/' in shpname else ['cp932','utf-8']):
+              for enc in (['utf-8','cp932'] if '/UTF-8/' in shp else ['cp932','utf-8']):
                 try:
                   x=shapefile.Reader(shp=io.BytesIO(z.read(need['.shp'])),shx=io.BytesIO(z.read(need['.shx'])),dbf=io.BytesIO(z.read(need['.dbf'])),encoding=enc)
                   if len(x): _=x.record(0)
-                  rdr=x; used=(shpname,enc); break
-                except UnicodeDecodeError: continue
+                  rdr=x; used=(shp,enc); break
+                except UnicodeDecodeError: pass
               if rdr is not None: break
-            if rdr is None: raise SystemExit(f'cannot decode station shp {year}')
+            if rdr is None: raise SystemExit(f'decode failure {y}')
             fields=[f[0] for f in rdr.fields[1:]]
-            if 'N02_005' not in fields: raise SystemExit(f'N02_005 missing {year} fields={fields}')
-            byname=defaultdict(list); total=0
+            for need in ['N02_003','N02_004','N02_005']:
+              if need not in fields: raise SystemExit(f'{y} missing {need}')
+            byname=defaultdict(list); n=0
             for sr in rdr.iterShapeRecords():
               d=dict(zip(fields,sr.record)); pt=center(sr.shape.points)
               if pt is None: continue
-              name=str(d.get('N02_005','')); nn=norm(name)
-              if not nn: continue
-              byname[nn].append((pt,name,str(d.get('N02_003','')),str(d.get('N02_004','')))); total+=1
-            snapshots[year]=byname; parse_meta[year]={'rows':total,'source':used[0],'encoding':used[1]}
-            print('PARSE',year,total,used)
+              nn=norm(d.get('N02_005')); line=norm(d.get('N02_003')); op=norm(d.get('N02_004'))
+              if nn: byname[nn].append({'pt':pt,'line':line,'op':op,'name':str(d.get('N02_005',''))}); n+=1
+            hist[y]=byname; parse[y]={'rows':n,'source':used[0],'encoding':used[1]}; print('PARSE',y,n,used)
 
-          out=[]; status_counts=Counter(); interval_counts=defaultdict(Counter)
+          out=[]; diag_counts=Counter(); kept_hits=[]
           for c in candidates:
-            fy=int(c['from_year']); ty=int(c['to_year']); nn=norm(c['future_station']); pt=(float(c['lat']),float(c['lon']))
-            seen=[]
+            fy=int(c['from_year']); nn=norm(c['future_station']); pt=(float(c['lat']),float(c['lon']))
+            pairs=[]
+            for token in c['future_operator_lines'].split(';'):
+              if '/' in token:
+                op,line=token.split('/',1); pairs.append((norm(op),norm(line)))
+            matches=[]
             for y in YEARS:
-              if y>ty: continue
-              best=None
-              for rpt,rname,line,op in snapshots[y].get(nn,[]):
-                d=hav(pt,rpt)
-                if d<=500 and (best is None or d<best): best=d
-              if best is not None: seen.append((y,round(best,2)))
-            prior=[x for x in seen if x[0]<=fy]
-            future=[x for x in seen if fy<x[0]<=ty]
-            first_future=min((y for y,d in future),default=None)
+              if y>fy: continue
+              for r in hist[y].get(nn,[]):
+                same_line=any(r['line']==line for op,line in pairs if line)
+                same_op=any(r['op']==op for op,line in pairs if op)
+                same_pair=any(r['op']==op and r['line']==line for op,line in pairs if op and line)
+                if same_line or same_pair:
+                  matches.append({'year':y,'distance_m':round(hav(pt,r['pt']),2),'same_line':same_line,'same_operator':same_op,'same_pair':same_pair,'line':r['line'],'operator':r['op']})
+            exact_pair=[m for m in matches if m['same_pair']]
+            same_line=[m for m in matches if m['same_line']]
+            diag='no_prior_same_service'
+            if exact_pair: diag='prior_same_name_same_operator_line'
+            elif same_line: diag='prior_same_name_same_line'
+            diag_counts[diag]+=1
 
             cls=c['class']; near300=(c['near_prior_station_300m']=='True')
-            if cls in ('new_line_candidate','extension_candidate'):
-              base_guard='keep_new_line_or_extension'
-            elif cls=='existing_line_infill_candidate' and not near300:
-              base_guard='keep_clean_infill'
-            elif cls=='existing_line_infill_candidate' and near300:
-              base_guard='exclude_infill_near_prior_300m'
-            else:
-              base_guard='exclude_geometry_recode_suspect'
+            base_keep=(cls in ('new_line_candidate','extension_candidate')) or (cls=='existing_line_infill_candidate' and not near300)
+            if base_keep and diag!='no_prior_same_service':
+              kept_hits.append({'from_year':c['from_year'],'to_year':c['to_year'],'station':c['future_station'],'class':cls,'diag':diag,
+                                'min_distance_m':min(m['distance_m'] for m in (exact_pair or same_line)),
+                                'years':sorted(set(m['year'] for m in (exact_pair or same_line))),
+                                'future_operator_lines':c['future_operator_lines']})
+            out.append({**c,'n02_prior_service_diag':diag,
+                        'n02_prior_service_years':';'.join(str(y) for y in sorted(set(m['year'] for m in (exact_pair or same_line)))),
+                        'n02_prior_service_min_distance_m':min((m['distance_m'] for m in (exact_pair or same_line)),default='')})
 
-            # Canonical additional guard: an exact normalized same-name station within 500m in ANY
-            # commercial-safe N02 snapshot at/before cutoff is a historical reappearance, not a new station.
-            if base_guard.startswith('keep_') and prior:
-              status='exclude_historical_reappearance'
-            elif base_guard.startswith('exclude_'):
-              status=base_guard
-            elif first_future is None:
-              status='unresolved_no_future_same_name_match'
-            else:
-              status='keep_n02_new_station'
-            boundary=(first_future==fy+1) if first_future is not None else False
-            status_counts[status]+=1; interval_counts[(fy,ty)][status]+=1
-            out.append({**c,'n02_base_guard':base_guard,'n02_seen_years':';'.join(str(y) for y,d in seen),
-                        'n02_seen_distances_m':';'.join(f'{y}:{d}' for y,d in seen),'n02_seen_before_or_at_cutoff':bool(prior),
-                        'n02_first_seen_after_cutoff':first_future,'n02_t_plus_1_diagnostic':boundary,'n02_longitudinal_status':status})
-
-          cols=list(candidates[0].keys())+['n02_base_guard','n02_seen_years','n02_seen_distances_m','n02_seen_before_or_at_cutoff','n02_first_seen_after_cutoff','n02_t_plus_1_diagnostic','n02_longitudinal_status']
-          outp=Path('out/n02_longitudinal_labels_v3.csv')
+          outp=Path('out/n02_historical_service_identity_v4.csv')
+          fields=list(candidates[0].keys())+['n02_prior_service_diag','n02_prior_service_years','n02_prior_service_min_distance_m']
           with outp.open('w',encoding='utf-8',newline='') as f:
-            w=csv.DictWriter(f,fieldnames=cols); w.writeheader(); w.writerows(out)
-
-          residual_names={'歓遊舎ひこさん','伏石'}
-          residual=[{k:r[k] for k in ['from_year','to_year','future_station','n02_seen_years','n02_first_seen_after_cutoff','n02_t_plus_1_diagnostic','n02_longitudinal_status']} for r in out if r['future_station'] in residual_names and r['from_year']=='2020']
-          kept=[r for r in out if r['n02_longitudinal_status']=='keep_n02_new_station']
-          boundary_kept=[r for r in kept if r['n02_t_plus_1_diagnostic']]
-          summary={
-            'canonical_topology_v2_sha256':CANONICAL_SHA,
-            'snapshot_years':YEARS,'snapshot_sha256':shas,'snapshot_urls':urls_used,'snapshot_parse_meta':parse_meta,
-            'candidate_rows':len(out),'status_counts':dict(status_counts),
-            'interval_status_counts':{f'{a}-{b}':dict(v) for (a,b),v in interval_counts.items()},
-            'kept_n02_new_station':len(kept),'kept_t_plus_1_diagnostic':len(boundary_kept),
-            'research_residual_lookup':residual,
-            't_plus_1_policy':'diagnostic_only_not_filter',
-          }
-          csv_sha=hashlib.sha256(outp.read_bytes()).hexdigest(); summary['csv_sha256']=csv_sha
-          Path('out/n02_longitudinal_labels_v3_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
-          print('STATUS',json.dumps(dict(status_counts),ensure_ascii=False))
-          print('INTERVALS',json.dumps(summary['interval_status_counts'],ensure_ascii=False))
-          print('RESIDUAL',json.dumps(residual,ensure_ascii=False))
-          print('T_PLUS_1_KEPT',len(boundary_kept))
-          print('CSV_SHA',csv_sha)
-          # Fail closed on data/source incompleteness only. t+1 remains diagnostic, not a post-hoc filter.
-          if len(out)!=195 or len(parse_meta)!=len(YEARS): raise SystemExit('coverage gate failed')
+            w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(out)
+          summary={'canonical_topology_v2_sha256':CANONICAL_SHA,'snapshot_years':YEARS,'snapshot_sha256':shas,'snapshot_urls':urls,
+                   'snapshot_parse_meta':parse,'diag_counts':dict(diag_counts),'base_kept_with_prior_same_service':kept_hits,
+                   'csv_sha256':hashlib.sha256(outp.read_bytes()).hexdigest()}
+          Path('out/n02_historical_service_identity_v4_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('DIAG_COUNTS',json.dumps(dict(diag_counts),ensure_ascii=False))
+          print('BASE_KEPT_PRIOR_SERVICE',json.dumps(kept_hits,ensure_ascii=False))
+          print('CSV_SHA',summary['csv_sha256'])
+          if len(parse)!=len(YEARS) or len(out)!=195: raise SystemExit('coverage failure')
           PY
           sha256sum out/*
-      - name: Upload N02 longitudinal memory
+      - name: Upload N02 historical service identity audit
         uses: actions/upload-artifact@v4
         with:
-          name: transit-future-n02-longitudinal-memory-v3
+          name: transit-future-n02-historical-service-v4
           path: out/
           if-no-files-found: error
           retention-days: 1
