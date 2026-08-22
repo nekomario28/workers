@@ -1,4 +1,4 @@
-name: Diagnostic Transit Future Label
+name: Diagnostic Transit Future Label Identity
 
 on:
   pull_request:
@@ -8,82 +8,191 @@ permissions:
   contents: read
 
 jobs:
-  discover:
+  audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
     steps:
-      - name: Discover N02 annual snapshot downloads and inspect station schema
+      - name: Audit physical station identity and snapshot additions
         shell: bash
         run: |
           set -euo pipefail
           python3 -m pip install --quiet 'requests==2.32.5' 'pyshp==2.3.1'
           mkdir -p out
           python3 - <<'PY'
-          import hashlib, io, json, re, requests, zipfile
+          import csv, hashlib, io, json, math, re, requests, unicodedata, zipfile
+          from collections import defaultdict
           from pathlib import Path
           import shapefile
 
-          years=[2011,2015,2020,2025]
-          yy={2011:'11',2015:'15',2020:'20',2025:'25'}
+          YEARS=[2011,2015,2020,2025]
+          CODES={2011:'11',2015:'15',2020:'20',2025:'25'}
+          SAME_NAME_M=500.0
+          GROUP_M=300.0
+          RENAME_M=300.0
           s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0'})
           index='https://nlftp.mlit.go.jp/ksj/gml/datalist/KsjTmplt-N02-2025.html'
-          ir=s.get(index,timeout=30); ir.raise_for_status(); html=ir.text
-          Path('out/index.html').write_text(html,encoding='utf-8')
-          summary=[]
-          for year in years:
-            code=yy[year]; fname=f'N02-{code}_GML.zip'
-            pos=html.find(fname)
-            print('INDEX',year,'FNAME_POS',pos)
-            if pos<0: raise SystemExit(f'{fname} not listed in canonical index')
-            candidates=[]
-            # Extract the canonical onclick relative path from the index when present.
-            for m in re.finditer(r"DownLd\([^)]*'([^']*%s)'" % re.escape(fname), html):
-              candidates.append(requests.compat.urljoin(index,m.group(1)))
-            candidates += [f'https://nlftp.mlit.go.jp/ksj/gml/data/N02/N02-{code}/{fname}']
-            seen=[]
-            for u in candidates:
-              if u not in seen: seen.append(u)
-            chosen=None; blob=None
-            for u in seen:
-              try:
-                rr=s.get(u,timeout=60,allow_redirects=True)
-                print('PROBE',year,rr.status_code,len(rr.content),rr.url,u)
-                if rr.status_code==200 and rr.content[:2]==b'PK': chosen=rr.url; blob=rr.content; break
-              except Exception as e: print('PROBE_ERR',year,u,repr(e))
-            if blob is None: raise SystemExit(f'no downloadable N02 zip resolved for {year}')
-            zsha=hashlib.sha256(blob).hexdigest(); Path(f'out/N02-{code}.zip').write_bytes(blob)
-            z=zipfile.ZipFile(io.BytesIO(blob)); names=z.namelist()
-            print('ZIP',year,zsha,len(names),names[:40])
-            shp=[n for n in names if n.lower().endswith('.shp') and 'station' in n.lower()]
-            station_count=None; fields=[]; samples=[]; station_file=None; encoding_used=None
-            for candidate in shp:
-              base=candidate[:-4]
+          html=s.get(index,timeout=30).text
+
+          def norm(x):
+            return ''.join(unicodedata.normalize('NFKC',str(x or '')).split())
+          def hav(a,b):
+            lat1,lon1=a; lat2,lon2=b
+            r=6371000.0
+            p1=math.radians(lat1); p2=math.radians(lat2)
+            dp=math.radians(lat2-lat1); dl=math.radians(lon2-lon1)
+            q=math.sin(dp/2)**2+math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+            return 2*r*math.asin(min(1,math.sqrt(q)))
+          def rep_point(shape):
+            pts=shape.points
+            if not pts: return (float('nan'),float('nan'))
+            # x=lon, y=lat. Mean of vertices is deterministic and works for point/polyline station geometry.
+            return (sum(p[1] for p in pts)/len(pts),sum(p[0] for p in pts)/len(pts))
+          def union_components(records):
+            n=len(records); parent=list(range(n))
+            def find(x):
+              while parent[x]!=x:
+                parent[x]=parent[parent[x]]; x=parent[x]
+              return x
+            def union(a,b):
+              a=find(a); b=find(b)
+              if a!=b: parent[b]=a
+            byname=defaultdict(list)
+            for i,r in enumerate(records): byname[r['name_n']].append(i)
+            for ids in byname.values():
+              for ai in range(len(ids)):
+                for bi in range(ai+1,len(ids)):
+                  i,j=ids[ai],ids[bi]
+                  if hav(records[i]['pt'],records[j]['pt'])<=GROUP_M: union(i,j)
+            comp=defaultdict(list)
+            for i in range(n): comp[find(i)].append(i)
+            groups=[]
+            for gi,ids in enumerate(comp.values()):
+              rs=[records[i] for i in ids]
+              lat=sum(r['pt'][0] for r in rs)/len(rs); lon=sum(r['pt'][1] for r in rs)/len(rs)
+              groups.append({
+                'gid':gi,'name':rs[0]['name'],'name_n':rs[0]['name_n'],'pt':(lat,lon),
+                'tuples':sorted(set((r['operator_n'],r['line_n']) for r in rs)),
+                'members':len(rs),'group_codes':sorted(set(r['group_code'] for r in rs if r['group_code']))
+              })
+            return groups
+          def load(year):
+            code=CODES[year]; fname=f'N02-{code}_GML.zip'
+            url=f'https://nlftp.mlit.go.jp/ksj/gml/data/N02/N02-{code}/{fname}'
+            rr=s.get(url,timeout=90); rr.raise_for_status(); blob=rr.content
+            zsha=hashlib.sha256(blob).hexdigest(); z=zipfile.ZipFile(io.BytesIO(blob)); names=z.namelist()
+            station=[n for n in names if n.lower().endswith('_station.shp')]
+            # Prefer UTF-8 in 2025 if available; otherwise first station shapefile.
+            station=sorted(station,key=lambda x:(0 if '/UTF-8/' in x else 1,x))
+            records=None; used=None; fields=None
+            for shpname in station:
+              base=shpname[:-4]
               need={ext:next((n for n in names if n.lower()==(base+ext).lower()),None) for ext in ['.shp','.shx','.dbf']}
               if not all(need.values()): continue
-              last_err=None
-              for enc in (['cp932','shift_jis','utf-8'] if year<=2015 else ['utf-8','cp932']):
+              encs=['utf-8','cp932'] if '/UTF-8/' in shpname else ['cp932','utf-8']
+              for enc in encs:
                 try:
                   rdr=shapefile.Reader(shp=io.BytesIO(z.read(need['.shp'])),shx=io.BytesIO(z.read(need['.shx'])),dbf=io.BytesIO(z.read(need['.dbf'])),encoding=enc)
-                  flds=[f[0] for f in rdr.fields[1:]]
-                  if not any(x in flds for x in ['N02_005','N02_005c','N02_005g']): break
-                  sm=[]
-                  for idx,sr in enumerate(rdr.iterShapeRecords()):
-                    if idx<5: sm.append(dict(zip(flds,sr.record)))
-                  fields=flds; station_count=len(rdr); samples=sm; station_file=candidate; encoding_used=enc
-                  break
-                except UnicodeDecodeError as e: last_err=e; continue
-              if station_count is not None: break
-              if last_err: print('ENCODING_FAIL',year,candidate,repr(last_err))
-            print('STATIONS',year,station_count,'SHP',station_file,'ENC',encoding_used,'FIELDS',fields,'SAMPLES',json.dumps(samples,ensure_ascii=False)[:10000])
-            summary.append({'year':year,'url':chosen,'zip_sha256':zsha,'station_shp':station_file,'station_count':station_count,'encoding':encoding_used,'fields':fields,'samples':samples})
-          assert all(x['station_count'] for x in summary), summary
-          Path('out/summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+                  fields=[f[0] for f in rdr.fields[1:]]; tmp=[]
+                  for sr in rdr.iterShapeRecords():
+                    d=dict(zip(fields,sr.record)); pt=rep_point(sr.shape)
+                    tmp.append({'name':str(d.get('N02_005','')),'name_n':norm(d.get('N02_005')),
+                      'line_n':norm(d.get('N02_003')),'operator_n':norm(d.get('N02_004')),
+                      'pt':pt,'group_code':str(d.get('N02_005g','') or '')})
+                  records=tmp; used=(shpname,enc); break
+                except UnicodeDecodeError: continue
+              if records is not None: break
+            if records is None: raise SystemExit(f'cannot parse stations {year}')
+            groups=union_components(records)
+            print('SNAPSHOT',year,'RAW_ROWS',len(records),'PHYSICAL_GROUPS',len(groups),'SHA',zsha,'SOURCE',used)
+            return {'year':year,'sha':zsha,'records':records,'groups':groups,'source':used}
+
+          snaps={y:load(y) for y in YEARS}
+
+          # 2025 grouping consistency against official N02_005g where available.
+          g25=snaps[2025]['groups']; total25=sum(g['members'] for g in g25); consistent=0; inconsistent=[]
+          for g in g25:
+            if len(g['group_codes'])<=1: consistent+=g['members']
+            else: inconsistent.append((g['name'],g['members'],g['group_codes']))
+          print('GROUP25_CONSISTENT_RECORDS',consistent,'/',total25,'INCONSISTENT_GROUPS',len(inconsistent))
+          for x in inconsistent[:20]: print('GROUP25_MISMATCH',x)
+
+          def diff(a,b):
+            A=snaps[a]['groups']; B=snaps[b]['groups']
+            unmatchedA=set(range(len(A))); unmatchedB=set(range(len(B))); pairs=[]; amb=[]
+            # Stage A: same normalized name <=500m, only unique candidate relation.
+            ca=defaultdict(list); cb=defaultdict(list)
+            for i in unmatchedA:
+              for j in unmatchedB:
+                if A[i]['name_n']==B[j]['name_n']:
+                  d=hav(A[i]['pt'],B[j]['pt'])
+                  if d<=SAME_NAME_M: ca[i].append((j,d)); cb[j].append((i,d))
+            candidates=[]
+            for i,v in ca.items():
+              if len(v)==1:
+                j,d=v[0]
+                if len(cb[j])==1: candidates.append((d,i,j))
+              elif len(v)>1: amb.append(('same_name_prior',i,[x[0] for x in v]))
+            for j,v in cb.items():
+              if len(v)>1: amb.append(('same_name_future',j,[x[0] for x in v]))
+            for d,i,j in sorted(candidates):
+              if i in unmatchedA and j in unmatchedB:
+                unmatchedA.remove(i); unmatchedB.remove(j); pairs.append(('stable_same_name',i,j,d))
+            # Stage B: shared operator+line <=300m. Ambiguous relations stay unmatched.
+            ca=defaultdict(list); cb=defaultdict(list)
+            for i in unmatchedA:
+              ta=set(A[i]['tuples'])
+              for j in unmatchedB:
+                if ta.intersection(B[j]['tuples']):
+                  d=hav(A[i]['pt'],B[j]['pt'])
+                  if d<=RENAME_M: ca[i].append((j,d)); cb[j].append((i,d))
+            candidates=[]
+            for i,v in ca.items():
+              if len(v)==1:
+                j,d=v[0]
+                if len(cb[j])==1: candidates.append((d,i,j))
+              elif len(v)>1: amb.append(('rename_prior',i,[x[0] for x in v]))
+            for j,v in cb.items():
+              if len(v)>1: amb.append(('rename_future',j,[x[0] for x in v]))
+            for d,i,j in sorted(candidates):
+              if i in unmatchedA and j in unmatchedB:
+                unmatchedA.remove(i); unmatchedB.remove(j); pairs.append(('rename_same_line',i,j,d))
+            print('DIFF',a,b,'stable',sum(p[0]=='stable_same_name' for p in pairs),'rename',sum(p[0]=='rename_same_line' for p in pairs),'add',len(unmatchedB),'remove',len(unmatchedA),'ambiguous_relations',len(amb))
+            return A,B,pairs,sorted(unmatchedA),sorted(unmatchedB),amb
+
+          allrows=[]; sanity={}
+          known_renames=[('船の科学館','東京国際クルーズターミナル',2015,2020),('業平橋','とうきょうスカイツリー',2011,2015)]
+          known_additions=[('高輪ゲートウェイ',2015,2020),('梅小路京都西',2015,2020)]
+          for a,b in zip(YEARS,YEARS[1:]):
+            A,B,pairs,rem,add,amb=diff(a,b)
+            pairmap={(A[i]['name'],B[j]['name']):cls for cls,i,j,d in pairs}
+            addnames=[B[j]['name'] for j in add]
+            for cls,i,j,d in pairs:
+              allrows.append([a,b,cls,A[i]['name'],B[j]['name'],round(d,3),A[i]['pt'][0],A[i]['pt'][1],B[j]['pt'][0],B[j]['pt'][1],A[i]['members'],B[j]['members'],';'.join('/'.join(t) for t in A[i]['tuples']),';'.join('/'.join(t) for t in B[j]['tuples'])])
+            for i in rem:
+              allrows.append([a,b,'apparent_removal',A[i]['name'],'','',A[i]['pt'][0],A[i]['pt'][1],'','',A[i]['members'],'',';'.join('/'.join(t) for t in A[i]['tuples']),''])
+            for j in add:
+              allrows.append([a,b,'apparent_addition','',B[j]['name'],'','','',B[j]['pt'][0],B[j]['pt'][1],'',B[j]['members'],'',';'.join('/'.join(t) for t in B[j]['tuples'])])
+            for old,new,ya,yb in known_renames:
+              if (a,b)==(ya,yb): sanity[f'{old}->{new}']=pairmap.get((old,new),'MISSING')
+            for name,ya,yb in known_additions:
+              if (a,b)==(ya,yb): sanity[name]='apparent_addition' if name in addnames else 'MISSING'
+          with open('out/station_identity_audit.csv','w',encoding='utf-8',newline='') as f:
+            w=csv.writer(f); w.writerow(['from_year','to_year','class','from_name','to_name','distance_m','from_lat','from_lon','to_lat','to_lon','from_members','to_members','from_operator_lines','to_operator_lines']); w.writerows(allrows)
+          summary={'rules':{'group_m':GROUP_M,'same_name_m':SAME_NAME_M,'rename_m':RENAME_M},'snapshots':{y:{'raw_sha256':snaps[y]['sha'],'raw_rows':len(snaps[y]['records']),'physical_groups':len(snaps[y]['groups']),'source':snaps[y]['source']} for y in YEARS},'group25_consistent_records':consistent,'group25_total_records':total25,'group25_inconsistent_groups':len(inconsistent),'sanity':sanity}
+          Path('out/identity_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('SANITY',json.dumps(sanity,ensure_ascii=False))
+          print('SUMMARY',json.dumps(summary,ensure_ascii=False))
+          # Sanity failures are evidence, not a reason to retune thresholds. Fail closed so the label is not frozen incorrectly.
+          expected={'船の科学館->東京国際クルーズターミナル':'rename_same_line','業平橋->とうきょうスカイツリー':'rename_same_line','高輪ゲートウェイ':'apparent_addition','梅小路京都西':'apparent_addition'}
+          bad={k:(sanity.get(k),v) for k,v in expected.items() if sanity.get(k)!=v}
+          if bad: raise SystemExit('KNOWN_CASE_SANITY_FAIL '+json.dumps(bad,ensure_ascii=False))
           PY
-          sha256sum out/* || true
-      - name: Upload transit label discovery evidence
+          sha256sum out/*
+      - name: Upload station identity audit
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: transit-future-label-discovery
+          name: transit-future-station-identity-audit
           path: out/
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 1
