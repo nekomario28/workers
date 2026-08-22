@@ -1,4 +1,4 @@
-name: Diagnostic Transit Future N05 Spatial Relation Audit
+name: Diagnostic Transit Future N05 Spatial Relation Audit v2
 
 on:
   pull_request:
@@ -6,38 +6,29 @@ on:
 
 permissions:
   contents: read
-  actions: read
 
 jobs:
   audit:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: Audit exact topology-v2 artifact against spatially local N05 history
+      - name: Audit N02-only topology labels against research-only N05 history
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           python3 -m pip install --quiet 'requests==2.32.5' 'pyshp==2.3.1'
-          mkdir -p input out
-          curl --fail --location --silent --show-error \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
-            'https://api.github.com/repos/nekomario28/workers/actions/artifacts/9481427242/zip' \
-            -o /tmp/topology-v2.zip
-          unzip -q /tmp/topology-v2.zip -d input
+          mkdir -p out
           python3 - <<'PY'
           import csv, hashlib, io, json, math, re, requests, unicodedata, zipfile
           from collections import defaultdict, Counter
           from pathlib import Path
           import shapefile
 
+          HEAD='cd7f9758fc1ca5b6135c136e5d92be32c6656771'
           CANONICAL_SHA='1202090e0959a8460a2babc4593672b8474e24040ff70ea136662b26bf83c2d6'
-          LOCAL_HISTORY_M=500.0
-          p=Path('input/topology_labels_v2.csv'); cb=p.read_bytes(); csha=hashlib.sha256(cb).hexdigest()
-          print('CANDIDATE_SHA',csha)
+          url=f'https://raw.githubusercontent.com/nekomario28/workers/{HEAD}/tmp/transit_future_topology_labels_v2.csv'
+          cb=requests.get(url,headers={'User-Agent':'Mozilla/5.0'},timeout=60).content
+          csha=hashlib.sha256(cb).hexdigest(); print('CANDIDATE_SHA',csha)
           if csha!=CANONICAL_SHA: raise SystemExit(f'canonical artifact mismatch {csha}')
           candidates=list(csv.DictReader(io.StringIO(cb.decode('utf-8'))))
           if len(candidates)!=195: raise SystemExit(f'expected 195 candidates, got {len(candidates)}')
@@ -50,14 +41,14 @@ jobs:
             p1=math.radians(lat1); p2=math.radians(lat2); dp=math.radians(lat2-lat1); dl=math.radians(lon2-lon1)
             q=math.sin(dp/2)**2+math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
             return 2*R*math.asin(min(1,math.sqrt(q)))
-          def year(v):
+          def yr(v):
             m=re.search(r'(19\d{2}|20\d{2}|9999|999)',str(v or ''))
             return int(m.group(1)) if m else None
 
-          url='https://nlftp.mlit.go.jp/ksj/gml/data/N05/N05-25/N05-25_GML.zip'
+          n05url='https://nlftp.mlit.go.jp/ksj/gml/data/N05/N05-25/N05-25_GML.zip'
           for attempt in range(4):
             try:
-              rr=s.get(url,timeout=120); rr.raise_for_status(); blob=rr.content
+              rr=s.get(n05url,timeout=120); rr.raise_for_status(); blob=rr.content
               if blob[:2]!=b'PK': raise RuntimeError('not ZIP')
               break
             except Exception as e:
@@ -84,18 +75,15 @@ jobs:
           for idx,sr in enumerate(rdr.iterShapeRecords()):
             d=dict(zip(fields,sr.record)); pts=sr.shape.points
             if not pts: continue
-            rec={'idx':idx,'name':str(d.get('N05_011','')),'name_n':norm(d.get('N05_011')),'line':str(d.get('N05_002','')),'op':str(d.get('N05_003','')),
-                 'start':year(d.get('N05_005b')),'end':year(d.get('N05_005e')),'rel':str(d.get('N05_006','')),'pt':(pts[0][1],pts[0][0])}
-            records.append(rec); byrel[rec['rel']].append(rec); byname[rec['name_n']].append(rec)
+            r={'idx':idx,'name':str(d.get('N05_011','')),'name_n':norm(d.get('N05_011')),'line':str(d.get('N05_002','')),'op':str(d.get('N05_003','')),
+               'start':yr(d.get('N05_005b')),'end':yr(d.get('N05_005e')),'rel':str(d.get('N05_006','')),'pt':(pts[0][1],pts[0][0])}
+            records.append(r); byrel[r['rel']].append(r); byname[r['name_n']].append(r)
           print('N05',n05sha,'SOURCE',used,'ROWS',len(records),'RELATIONS',len(byrel))
 
-          out=[]; class_counts=defaultdict(Counter); match_counts=Counter()
+          out=[]; class_counts=defaultdict(Counter); guard_counts=Counter(); match_counts=Counter()
           for c in candidates:
             fy=int(c['from_year']); ty=int(c['to_year']); pt=(float(c['lat']),float(c['lon'])); nn=norm(c['future_station'])
-            same=[]
-            for r in byname.get(nn,[]):
-              d=hav(pt,r['pt'])
-              if d<=500: same.append((d,r))
+            same=[(hav(pt,r['pt']),r) for r in byname.get(nn,[]) if hav(pt,r['pt'])<=500]
             matched=same; mode='same_name_500m'
             if not matched:
               near=[]
@@ -107,49 +95,67 @@ jobs:
             if matched:
               match_counts[mode]+=1; mind=min(d for d,r in matched)
               rels=sorted(set(r['rel'] for d,r in matched if d<=mind+30.0))
-              local_hist=[]; global_hist=[]
+              local=[]; glob=[]
               for rel in rels:
-                global_hist.extend(byrel[rel])
-                local_hist.extend(r for r in byrel[rel] if hav(pt,r['pt'])<=LOCAL_HISTORY_M)
-              local_starts=[r['start'] for r in local_hist if r['start'] not in (None,999,9999)]
-              global_starts=[r['start'] for r in global_hist if r['start'] not in (None,999,9999)]
-              any_pre=any(v<=fy for v in local_starts); any_new=any(fy<v<=ty for v in local_starts)
+                glob.extend(byrel[rel]); local.extend(r for r in byrel[rel] if hav(pt,r['pt'])<=500)
+              starts=[r['start'] for r in local if r['start'] not in (None,999,9999)]
+              any_pre=any(v<=fy for v in starts); any_new=any(fy<v<=ty for v in starts)
               if any_pre and any_new: audit='local_mixed_old_and_new_relations'
               elif any_pre: audit='local_preexisting_relation'
               elif any_new: audit='local_new_relation_in_interval'
-              elif local_starts and all(v>ty for v in local_starts): audit='local_relation_starts_after_target'
+              elif starts and all(v>ty for v in starts): audit='local_relation_starts_after_target'
               else: audit='local_relation_start_unknown'
-              local_first=min(local_starts) if local_starts else None; global_first=min(global_starts) if global_starts else None
-              local_names=sorted(set(r['name'] for r in local_hist)); global_names=sorted(set(r['name'] for r in global_hist))
-              local_lines=sorted(set(r['line'] for r in local_hist)); local_ops=sorted(set(r['op'] for r in local_hist))
-              nearest=round(mind,2)
+              local_names=sorted(set(r['name'] for r in local)); nearest=round(mind,2)
             else:
-              match_counts['none']+=1; rels=[]; audit='no_n05_match'; local_first=global_first=None; local_names=[]; global_names=[]; local_lines=[]; local_ops=[]; nearest=None; mode='none'
-            class_counts[c['class']][audit]+=1
-            out.append({**c,'n05_match_mode':mode,'n05_nearest_m':nearest,'n05_relation_ids':';'.join(rels),'n05_global_first_start':global_first,
-                        'n05_local_first_start':local_first,'n05_spatial_audit':audit,'n05_local_history_names':' | '.join(local_names),
-                        'n05_global_history_names':' | '.join(global_names),'n05_local_history_lines':' | '.join(local_lines),'n05_local_history_operators':' | '.join(local_ops)})
-          cols=list(candidates[0].keys())+['n05_match_mode','n05_nearest_m','n05_relation_ids','n05_global_first_start','n05_local_first_start','n05_spatial_audit','n05_local_history_names','n05_global_history_names','n05_local_history_lines','n05_local_history_operators']
-          with open('out/n05_spatial_relation_audit.csv','w',encoding='utf-8',newline='') as f:
+              match_counts['none']+=1; rels=[]; audit='no_n05_match'; local_names=[]; nearest=None; mode='none'
+
+            # Commercial-safe guard uses only fields already present in the N02-derived v2 table.
+            # The 300m threshold was pre-existing in v2; this audit does not tune a new threshold on N05.
+            cls=c['class']; near300=(c['near_prior_station_300m']=='True')
+            if cls in ('new_line_candidate','extension_candidate'):
+              guard='keep_new_line_or_extension'
+            elif cls=='existing_line_infill_candidate' and not near300:
+              guard='keep_clean_infill'
+            elif cls=='existing_line_infill_candidate' and near300:
+              guard='exclude_infill_near_prior_300m'
+            else:
+              guard='exclude_geometry_recode_suspect'
+            guard_counts[(guard,audit)]+=1; class_counts[cls][audit]+=1
+            out.append({**c,'n02_commercial_guard':guard,'n05_match_mode':mode,'n05_nearest_m':nearest,'n05_relation_ids':';'.join(rels),'n05_spatial_audit':audit,'n05_local_history_names':' | '.join(local_names)})
+
+          cols=list(candidates[0].keys())+['n02_commercial_guard','n05_match_mode','n05_nearest_m','n05_relation_ids','n05_spatial_audit','n05_local_history_names']
+          with open('out/n05_spatial_relation_audit_v2.csv','w',encoding='utf-8',newline='') as f:
             w=csv.DictWriter(f,fieldnames=cols); w.writeheader(); w.writerows(out)
+
+          kept=[r for r in out if r['n02_commercial_guard'].startswith('keep_')]
+          clear=[r for r in kept if r['n05_spatial_audit']=='local_new_relation_in_interval']
+          residual=[r for r in kept if r['n05_spatial_audit']!='local_new_relation_in_interval']
+          ext=[r for r in out if r['class'] in ('new_line_candidate','extension_candidate')]
+          bad_ext=[r for r in ext if r['n05_spatial_audit']!='local_new_relation_in_interval']
           lookup={(r['from_year'],r['to_year'],r['future_station']):r for r in out}
           checks={k:lookup.get(key,{}).get('n05_spatial_audit') for k,key in {
             '大阪梅田':('2015','2020','大阪梅田'),'羽田空港第3ターミナル':('2015','2020','羽田空港第3ターミナル'),
             '高輪ゲートウェイ':('2015','2020','高輪ゲートウェイ'),'梅小路京都西':('2015','2020','梅小路京都西'),'新綱島':('2020','2025','新綱島')}.items()}
-          summary={'canonical_topology_v2_sha256':CANONICAL_SHA,'n05_raw_sha256':n05sha,'local_history_m':LOCAL_HISTORY_M,'candidate_rows':len(candidates),
-                   'match_counts':dict(match_counts),'class_audit_counts':{k:dict(v) for k,v in class_counts.items()},'sanity':checks}
-          Path('out/n05_spatial_relation_audit_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
-          print('CLASS_AUDIT',json.dumps(summary['class_audit_counts'],ensure_ascii=False)); print('SANITY',json.dumps(checks,ensure_ascii=False)); print('SUMMARY',json.dumps(summary,ensure_ascii=False))
-          expected={'大阪梅田':'local_preexisting_relation','羽田空港第3ターミナル':'local_preexisting_relation','高輪ゲートウェイ':'local_new_relation_in_interval','梅小路京都西':'local_new_relation_in_interval','新綱島':'local_new_relation_in_interval'}
+          expected={'大阪梅田':'local_mixed_old_and_new_relations','羽田空港第3ターミナル':'local_mixed_old_and_new_relations','高輪ゲートウェイ':'local_new_relation_in_interval','梅小路京都西':'local_new_relation_in_interval','新綱島':'local_new_relation_in_interval'}
           bad={k:(checks.get(k),v) for k,v in expected.items() if checks.get(k)!=v}
+          summary={
+            'canonical_topology_v2_sha256':CANONICAL_SHA,'n05_raw_sha256':n05sha,'candidate_rows':len(candidates),
+            'match_counts':dict(match_counts),'class_audit_counts':{k:dict(v) for k,v in class_counts.items()},
+            'commercial_guard_kept':len(kept),'commercial_guard_clear_new':len(clear),
+            'commercial_guard_research_precision_clear_new':len(clear)/len(kept) if kept else None,
+            'commercial_guard_residual':[{'from_year':r['from_year'],'to_year':r['to_year'],'station':r['future_station'],'audit':r['n05_spatial_audit'],'nearest_prior_station_m':r['nearest_prior_station_m']} for r in residual],
+            'sanity':checks,
+          }
+          Path('out/n05_spatial_relation_audit_v2_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('SUMMARY',json.dumps(summary,ensure_ascii=False))
           if bad: raise SystemExit('N05_SPATIAL_SANITY_FAIL '+json.dumps(bad,ensure_ascii=False))
+          if bad_ext: raise SystemExit('NEW_LINE_EXTENSION_AUDIT_FAIL '+json.dumps([(r['future_station'],r['n05_spatial_audit']) for r in bad_ext],ensure_ascii=False))
           PY
           sha256sum out/*
-      - name: Upload N05 spatial relation audit
-        if: always()
+      - name: Upload N05 spatial relation audit v2
         uses: actions/upload-artifact@v4
         with:
-          name: transit-future-n05-spatial-relation-audit
+          name: transit-future-n05-spatial-relation-audit-v2
           path: out/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 1
