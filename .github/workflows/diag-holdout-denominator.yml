@@ -1,4 +1,4 @@
-name: Diagnostic Holdout Demand Freeze 2020-2021
+name: Diagnostic Holdout Physical Inspect FY2022 FY2023
 
 on:
   pull_request:
@@ -8,128 +8,64 @@ permissions:
   contents: read
 
 jobs:
-  freeze:
+  inspect:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Freeze cutoff-safe 2020-2021 Demand Momentum for 30 regions
+      - name: Inspect official FY2022/FY2023 building-start workbooks
         shell: bash
         run: |
           set -euo pipefail
           python3 -m pip install --quiet 'openpyxl==3.1.5' 'xlrd==2.0.1' 'requests==2.32.5'
           mkdir -p out
           python3 - <<'PY'
-          import csv, hashlib, json, math, requests
+          import hashlib, requests
           from pathlib import Path
           import openpyxl, xlrd
-
-          SOURCES={
-            '2020_main':'000031971203',
-            '2020_age':'000031971230',
-            '2021_main':'000040306659',
-            '2021_age':'000040306661',
-          }
-          TARGETS={
-            '13101':'千代田区','13102':'中央区','13103':'港区','13104':'新宿区','13105':'文京区','13106':'台東区','13107':'墨田区','13108':'江東区','13109':'品川区','13110':'目黒区','13111':'大田区','13112':'世田谷区','13113':'渋谷区','13114':'中野区','13115':'杉並区','13116':'豊島区','13117':'北区','13118':'荒川区','13119':'板橋区','13120':'練馬区','13121':'足立区','13122':'葛飾区','13123':'江戸川区',
-            '40131':'福岡市東区','40132':'福岡市博多区','40133':'福岡市中央区','40134':'福岡市南区','40135':'福岡市西区','40136':'福岡市城南区','40137':'福岡市早良区'
-          }
-          shas={}; rows_by_source={}; formats={}
-          sess=requests.Session(); sess.headers['User-Agent']='Mozilla/5.0'
-
-          def load_rows(blob,label):
-            if blob[:4]==b'PK\x03\x04':
-              p=Path(f'out/{label}.xlsx'); p.write_bytes(blob)
-              wb=openpyxl.load_workbook(p,data_only=True,read_only=True); ws=wb.worksheets[0]
-              formats[label]='OOXML'
-              return [tuple(r) for r in ws.iter_rows(values_only=True)]
-            if blob[:8]==bytes.fromhex('D0CF11E0A1B11AE1'):
-              p=Path(f'out/{label}.xls'); p.write_bytes(blob)
-              wb=xlrd.open_workbook(file_contents=blob); sh=wb.sheet_by_index(0)
-              formats[label]='BIFF8/OLE'
-              return [tuple(sh.row_values(i)) for i in range(sh.nrows)]
-            raise SystemExit(f'unknown excel signature {label} {blob[:8]!r}')
-
+          SOURCES={'FY2022':'000040052251','FY2023':'000040179628'}
+          s=requests.Session(); s.headers['User-Agent']='Mozilla/5.0'
           for label,sid in SOURCES.items():
             u=f'https://www.e-stat.go.jp/stat-search/file-download?fileKind=0&statInfId={sid}'
-            r=sess.get(u,timeout=60); r.raise_for_status()
-            shas[label]=hashlib.sha256(r.content).hexdigest()
-            rows_by_source[label]=load_rows(r.content,label)
-            print('SOURCE',label,sid,len(r.content),formats[label],shas[label],len(rows_by_source[label]))
-
-          def code5(v):
-            s=str(v or '').strip()
-            if s.endswith('.0'): s=s[:-2]
-            return s[:5] if len(s)>=5 and s[:5].isdigit() else None
-
-          def main_rows(rows):
-            out={}
-            for row in rows:
-              if len(row)<=24: continue
-              c=code5(row[0])
-              if c in TARGETS:
-                if c in out: raise SystemExit(f'duplicate main row {c}')
-                out[c]={
-                  'population':float(row[5]),
-                  'households':float(row[6]),
-                  'population_change_rate':float(row[20]),
-                  'social_change_rate':float(row[24]),
-                }
-            return out
-
-          def age_rows(rows):
-            out={}
-            for row in rows:
-              if len(row)<=10: continue
-              c=code5(row[0])
-              if c not in TARGETS: continue
-              sex=str(row[3] or '').strip()
-              if sex!='計': continue
-              if c in out: raise SystemExit(f'duplicate age total row {c}')
-              total=float(row[4]); a20=float(row[9]); a25=float(row[10])
-              out[c]={'total':total,'age20_29':a20+a25}
-            return out
-
-          m20=main_rows(rows_by_source['2020_main']); a20=age_rows(rows_by_source['2020_age'])
-          m21=main_rows(rows_by_source['2021_main']); a21=age_rows(rows_by_source['2021_age'])
-          expected=set(TARGETS)
-          for label,d in [('2020_main',m20),('2020_age',a20),('2021_main',m21),('2021_age',a21)]:
-            if set(d)!=expected: raise SystemExit(f'{label} coverage mismatch missing={sorted(expected-set(d))} extra={sorted(set(d)-expected)}')
-
-          rows=[]
-          for c in sorted(TARGETS):
-            hh0=m20[c]['households']; hh1=m21[c]['households']
-            age0=a20[c]['age20_29']; age1=a21[c]['age20_29']; pop1=a21[c]['total']
-            vals={
-              'population_change_rate_2020_pct':m21[c]['population_change_rate'],
-              'social_change_rate_2020_pct':m21[c]['social_change_rate'],
-              'household_growth_2020_to_2021_pct':(hh1/hh0-1.0)*100.0,
-              'age20_29_share_2021_pct':age1/pop1*100.0,
-              'age20_29_growth_2020_to_2021_pct':(age1/age0-1.0)*100.0,
-            }
-            if not all(math.isfinite(v) for v in vals.values()): raise SystemExit(f'nonfinite {c} {vals}')
-            rows.append({'region_code':c,'region_name':TARGETS[c],'metro':'Tokyo' if c.startswith('13') else 'Fukuoka',**vals})
-
-          outp=Path('out/demand_momentum_holdout_2022.csv')
-          fields=list(rows[0].keys())
-          with outp.open('w',encoding='utf-8',newline='') as f:
-            w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(rows)
-          csv_sha=hashlib.sha256(outp.read_bytes()).hexdigest()
-          meta={
-            'cutoff':'2022-03-31','regions':30,'Tokyo':23,'Fukuoka':7,
-            'source_statInfId':SOURCES,'source_sha256':shas,'source_format':formats,
-            'features':fields[3:],'csv_sha256':csv_sha,'zero_fill':False,
-          }
-          Path('out/demand_momentum_holdout_2022_meta.json').write_text(json.dumps(meta,ensure_ascii=False,indent=2),encoding='utf-8')
-          print('GATE regions=30 unique=30 complete_sources=4 no_missing=1 no_zero_fill=1')
-          print('CSV_SHA',csv_sha)
-          print('META',json.dumps(meta,ensure_ascii=False))
-          for r in rows: print('ROW',json.dumps(r,ensure_ascii=False))
+            r=s.get(u,timeout=60); r.raise_for_status(); b=r.content
+            sha=hashlib.sha256(b).hexdigest(); print('RAW',label,sid,len(b),b[:8],sha)
+            if b[:4]==b'PK\x03\x04':
+              p=Path(f'out/{label}.xlsx'); p.write_bytes(b)
+              wb=openpyxl.load_workbook(p,data_only=True,read_only=True)
+              print('FORMAT',label,'OOXML','SHEETS',[(ws.title,ws.max_row,ws.max_column) for ws in wb.worksheets])
+              for ws in wb.worksheets:
+                for ri,row in enumerate(ws.iter_rows(min_row=1,max_row=min(ws.max_row,18),values_only=True),1):
+                  vals=[f'{i}:{v}' for i,v in enumerate(row) if v not in (None,'')]
+                  if vals: print('HEAD',label,ws.title,ri,' || '.join(vals)[:9000])
+                hit=0
+                for ri,row in enumerate(ws.iter_rows(values_only=True),1):
+                  txt=' | '.join(str(v) for v in row if v not in (None,''))
+                  if '13101' in txt or '40131' in txt or '千代田区' in txt or '福岡市東区' in txt:
+                    vals=[f'{i}:{v}' for i,v in enumerate(row) if v not in (None,'')]
+                    print('TARGET',label,ws.title,ri,' || '.join(vals)[:12000]); hit+=1
+                    if hit>=8: break
+            elif b[:8]==bytes.fromhex('D0CF11E0A1B11AE1'):
+              p=Path(f'out/{label}.xls'); p.write_bytes(b)
+              wb=xlrd.open_workbook(file_contents=b)
+              print('FORMAT',label,'BIFF8/OLE','SHEETS',[(sh.name,sh.nrows,sh.ncols) for sh in wb.sheets()])
+              for sh in wb.sheets():
+                for ri in range(min(sh.nrows,18)):
+                  row=sh.row_values(ri); vals=[f'{i}:{v}' for i,v in enumerate(row) if v not in (None,'')]
+                  if vals: print('HEAD',label,sh.name,ri+1,' || '.join(vals)[:9000])
+                hit=0
+                for ri in range(sh.nrows):
+                  row=sh.row_values(ri); txt=' | '.join(str(v) for v in row if v not in (None,''))
+                  if '13101' in txt or '40131' in txt or '千代田区' in txt or '福岡市東区' in txt:
+                    vals=[f'{i}:{v}' for i,v in enumerate(row) if v not in (None,'')]
+                    print('TARGET',label,sh.name,ri+1,' || '.join(vals)[:12000]); hit+=1
+                    if hit>=8: break
+            else:
+              raise SystemExit(f'unknown workbook signature {label} {b[:16]!r}')
           PY
           sha256sum out/*
-      - name: Upload frozen Demand Momentum
+      - name: Upload Physical inspection
         uses: actions/upload-artifact@v4
         with:
-          name: holdout-demand-freeze-2022
+          name: holdout-physical-inspection-fy2022-fy2023
           path: out/
           if-no-files-found: error
           retention-days: 1
