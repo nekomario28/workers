@@ -7,6 +7,7 @@ on:
 permissions:
   contents: read
 
+# Temporary research workflow; never merge.
 jobs:
   discover:
     runs-on: ubuntu-latest
@@ -36,28 +37,23 @@ jobs:
             soup=BeautifulSoup(r.text,'html.parser')
             for a in soup.find_all('a',href=True):
               h=urljoin(r.url,a['href']); t=' '.join(a.stripped_strings)
-              if 'statInfId=' in h or 'file-download' in h or 'EXCEL' in t.upper():
-                found.append((t,h))
-          # de-dup
+              if 'statInfId=' in h or 'file-download' in h or 'EXCEL' in t.upper(): found.append((t,h))
           seen=set(); found=[x for x in found if not (x[1] in seen or seen.add(x[1]))]
           pathlib.Path('out/links.tsv').write_text('\n'.join(t+'\t'+u for t,u in found),encoding='utf-8')
           print('LINKS',len(found))
-          for t,u in found:
-            print('LINK',t[:120],u)
+          for t,u in found: print('LINK',t[:120],u)
           ids=[]
           for t,u in found:
             m=re.search(r'statInfId=(\d+)',u)
             if m: ids.append(m.group(1))
           print('STATINFIDS',sorted(set(ids)))
-          # Probe candidate workbook links from pages. Save any Excel binary >=10KB.
           n=0
           for t,u in found:
             if 'file-download' not in u: continue
-            rr=s.get(u,timeout=60,allow_redirects=True)
-            sig=rr.content[:8]
+            rr=s.get(u,timeout=60,allow_redirects=True); sig=rr.content[:8]
             print('FETCH',rr.status_code,len(rr.content),sig,t[:80],u)
             if rr.status_code==200 and len(rr.content)>10000 and (sig.startswith(b'PK') or sig.startswith(bytes.fromhex('D0CF11E0'))):
-              p=pathlib.Path(f'out/candidate_{n}.bin'); p.write_bytes(rr.content); n+=1
+              pathlib.Path(f'out/candidate_{n}.bin').write_bytes(rr.content); n+=1
           print('EXCEL_CANDIDATES',n)
           PY
           sha256sum out/* || true
