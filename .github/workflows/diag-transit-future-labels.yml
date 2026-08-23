@@ -1,4 +1,4 @@
-name: Diagnostic Transit Future Census Mesh Transport
+name: Diagnostic Transit Future Census Mesh CSV Inspect
 
 on:
   pull_request:
@@ -8,72 +8,50 @@ permissions:
   contents: read
 
 jobs:
-  resolve:
+  inspect:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Resolve official e-Stat 2015 500m mesh download rows
+      - name: Inspect official e-Stat 2015 500m mesh CSV files
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet 'requests==2.32.5' 'beautifulsoup4==4.13.4'
+          python3 -m pip install --quiet 'requests==2.32.5'
           mkdir -p out
           python3 - <<'PY'
-          import json,re,requests
+          import csv,hashlib,io,requests
           from pathlib import Path
-          from bs4 import BeautifulSoup
-          from urllib.parse import urljoin
-          BASE='https://www.e-stat.go.jp'
-          END=BASE+'/gis/statmap-search/search_detail'
-          base_params={
-            'type':'1','toukeiCode':'00200521','toukeiYear':'2015','aggregateUnit':'H',
-            'serveyId':'H002005112015','statsId':'T000847','mesh_data_flg':'1',
-            'download_disp_flg':'1','page':'1'
-          }
-          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0','Accept':'application/json, text/javascript, */*; q=0.01','X-Requested-With':'XMLHttpRequest','Referer':BASE+'/gis/statmap-search?type=1'})
-          rows=[]
-          for label,extra in [('national',{}),('tokyo',{'prefCode':'13'}),('fukuoka',{'prefCode':'40'}),('osaka',{'prefCode':'27'})]:
-            p={**base_params,**extra}
-            r=s.get(END,params=p,timeout=60); print('REQ',label,r.status_code,len(r.content),r.url); r.raise_for_status()
-            Path(f'out/{label}.json').write_bytes(r.content)
-            try:j=r.json()
-            except Exception as e: raise SystemExit(f'JSON decode failed {label}: {e}')
-            print('KEYS',label,sorted(j.keys()))
-            for k,v in j.items():
-              if isinstance(v,str): print('FIELD',label,k,'len',len(v),'sample',v[:1200].replace('\n',' '))
-              elif isinstance(v,dict): print('DICT',label,k,'keys',list(v)[:80])
-              elif isinstance(v,list): print('LIST',label,k,'n',len(v))
-            blobs=[]
-            def walk(x,path=''):
-              if isinstance(x,dict):
-                for k,v in x.items(): walk(v,path+'/'+str(k))
-              elif isinstance(x,list):
-                for i,v in enumerate(x): walk(v,path+f'/{i}')
-              elif isinstance(x,str):
-                low=x.lower()
-                if any(q in low for q in ['download','zip','csv','t000847','500m','mesh']): blobs.append((path,x))
-            walk(j)
-            print('BLOBS',label,len(blobs))
-            for path,x in blobs[:300]: print('BLOB',label,path,x[:5000].replace('\n',' '))
-            # Parse every HTML-like string for href/data attributes and preserve rows with download controls.
-            for path,x in blobs:
-              if '<' not in x: continue
-              soup=BeautifulSoup(x,'html.parser')
-              for tag in soup.find_all(True):
-                attrs={k:(' '.join(v) if isinstance(v,list) else str(v)) for k,v in tag.attrs.items()}
-                txt=' '.join(tag.stripped_strings)
-                joined=' '.join([tag.name,txt,*attrs.keys(),*attrs.values()])
-                if any(q in joined.lower() for q in ['download','zip','csv','t000847','mesh']):
-                  rows.append({'scope':label,'json_path':path,'tag':tag.name,'text':txt[:1000],'attrs':json.dumps(attrs,ensure_ascii=False)})
-          Path('out/parsed_rows.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
-          print('PARSED_ROWS',len(rows))
-          for x in rows[:500]: print('ROW',json.dumps(x,ensure_ascii=False)[:7000])
+          BASE='https://www.e-stat.go.jp/gis/statmap-search/data'
+          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0','Referer':'https://www.e-stat.go.jp/gis/statmap-search'})
+          for code in ['5339','5030']:
+            u=BASE; r=s.get(u,params={'statsId':'T000847','code':code,'downloadType':'2'},timeout=90,allow_redirects=True)
+            print('FETCH',code,r.status_code,len(r.content),r.url,r.headers.get('content-type'),r.headers.get('content-disposition'))
+            r.raise_for_status(); Path(f'out/{code}.bin').write_bytes(r.content)
+            print('SHA',code,hashlib.sha256(r.content).hexdigest(),'SIG',r.content[:16])
+            # CSV endpoint may return raw CSV or a ZIP; inspect both.
+            data=r.content
+            if data[:2]==b'PK':
+              import zipfile
+              z=zipfile.ZipFile(io.BytesIO(data)); print('ZIP',code,z.namelist())
+              for n in z.namelist():
+                b=z.read(n); Path(f'out/{code}_{Path(n).name}').write_bytes(b)
+                print('ZIPFILE',code,n,len(b),hashlib.sha256(b).hexdigest(),b[:20])
+                if n.lower().endswith(('.csv','.txt')): data=b; break
+            # Try common Japanese encodings and print first 8 parsed rows.
+            for enc in ['cp932','shift_jis','utf-8-sig','utf-8']:
+              try:
+                text=data.decode(enc); print('ENCODING',code,enc); break
+              except Exception: pass
+            else: raise SystemExit(f'cannot decode {code}')
+            Path(f'out/{code}_decoded.txt').write_text(text,encoding='utf-8')
+            rd=csv.reader(io.StringIO(text))
+            for i,row in zip(range(10),rd): print('ROW',code,i,row[:80])
           PY
           sha256sum out/*
-      - name: Upload transport evidence
+      - name: Upload CSV inspection
         uses: actions/upload-artifact@v4
         with:
-          name: transit-future-census-mesh-transport
+          name: transit-future-census-mesh-csv-inspect
           path: out/
           if-no-files-found: error
           retention-days: 2
