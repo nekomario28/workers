@@ -42,13 +42,13 @@ jobs:
           echo 'af485797942888ae6d6b6bc0d1777e791e8715cba5d83c3b117cec0fc6eac394  /tmp/demand/2021_age.xlsx' | sha256sum -c -
           echo '73249e927cf4363b375b2fbdafc6d5c2466c566998cba4844b3c5b505c6cd35b  /tmp/denom/table1.xls' | sha256sum -c -
 
-      - name: Install legacy XLS reader
-        run: python -m pip install --disable-pip-version-check xlrd==2.0.2
+      - name: Install original temporal Excel readers
+        run: python -m pip install --disable-pip-version-check openpyxl==3.1.5 xlrd==2.0.1
 
-      - name: Freeze age-growth predictor and 2016 denominator
+      - name: Recompute correction audit and freeze fresh sources
         run: python scripts/age_growth_fresh_source_freeze.py
 
-      - name: Upload fresh source freeze
+      - name: Upload correction audit and fresh source freeze
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: age-growth-fresh-source-freeze
