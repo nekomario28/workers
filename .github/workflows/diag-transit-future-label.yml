@@ -1,4 +1,4 @@
-name: Diagnostic Transit Future N02 GML Relation Audit
+name: Diagnostic Transit Future N02 XML Encoding Audit
 
 on:
   pull_request:
@@ -12,51 +12,44 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Inspect 2020 N02 GML station-section relations
+      - name: Inspect N02-20 XML declaration and invalid token
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import hashlib, io, json, requests, zipfile, xml.etree.ElementTree as ET
+          import hashlib, io, json, requests, zipfile
           from pathlib import Path
           u='https://nlftp.mlit.go.jp/ksj/gml/data/N02/N02-20/N02-20_GML.zip'
           r=requests.get(u,headers={'User-Agent':'Mozilla/5.0'},timeout=120); r.raise_for_status()
-          print('RAW',len(r.content),hashlib.sha256(r.content).hexdigest())
-          z=zipfile.ZipFile(io.BytesIO(r.content)); names=z.namelist()
-          print('FILES',json.dumps(names[:80],ensure_ascii=False))
-          gmls=[n for n in names if n.lower().endswith(('.xml','.gml'))]
-          print('GML_FILES',gmls)
-          if not gmls: raise SystemExit('no GML/XML found')
-          target=max(gmls,key=lambda n: z.getinfo(n).file_size)
-          print('TARGET',target,z.getinfo(target).file_size)
-          sample={'RailroadSection':None,'Station':None}; counts={'RailroadSection':0,'Station':0}; child_tags={}
-          hrefs={'RailroadSection':[],'Station':[]}
-          XLINK='{http://www.w3.org/1999/xlink}href'
-          for ev,el in ET.iterparse(io.BytesIO(z.read(target)),events=('end',)):
-            local=el.tag.split('}')[-1]
-            if local in sample:
-              counts[local]+=1
-              if sample[local] is None:
-                sample[local]=ET.tostring(el,encoding='unicode')[:12000]
-                child_tags[local]=[c.tag.split('}')[-1] for c in list(el)]
-                for d in el.iter():
-                  if XLINK in d.attrib: hrefs[local].append((d.tag.split('}')[-1],d.attrib[XLINK]))
-              el.clear()
-          print('COUNTS',counts)
-          print('CHILD_TAGS',json.dumps(child_tags,ensure_ascii=False))
-          print('HREFS',json.dumps(hrefs,ensure_ascii=False))
-          print('RAILROAD_SAMPLE',sample['RailroadSection'])
-          print('STATION_SAMPLE',sample['Station'])
-          out={'source_url':u,'source_sha256':hashlib.sha256(r.content).hexdigest(),'gml_file':target,
-               'counts':counts,'child_tags':child_tags,'xlink_hrefs':hrefs,
-               'railroad_sample':sample['RailroadSection'],'station_sample':sample['Station']}
-          Path('relation_audit.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
-          print('SUMMARY_SHA',hashlib.sha256(Path('relation_audit.json').read_bytes()).hexdigest())
+          z=zipfile.ZipFile(io.BytesIO(r.content)); target='N02-20_GML/N02-20.xml'; b=z.read(target)
+          print('ZIP_SHA',hashlib.sha256(r.content).hexdigest(),'XML_BYTES',len(b))
+          print('HEAD_HEX',b[:512].hex())
+          print('HEAD_REPR',repr(b[:2048]))
+          results={}
+          for enc in ['utf-8','cp932','shift_jis','euc_jp','iso2022_jp']:
+            try:
+              s=b[:8192].decode(enc)
+              results[enc]={'ok':True,'head':s[:3000]}
+              print('DECODE',enc,'OK',repr(s[:1500]))
+            except Exception as e:
+              results[enc]={'ok':False,'error':repr(e)}
+              print('DECODE',enc,'FAIL',repr(e))
+          # Show raw bytes around parser failure location: line 8, col 17 from prior run.
+          lines=b.splitlines(keepends=True)
+          for i in range(min(12,len(lines))):
+            print('RAW_LINE',i+1,repr(lines[i][:1000]))
+          if len(lines)>=8:
+            ln=lines[7]
+            print('LINE8_HEX',ln[:256].hex())
+          out={'source_url':u,'zip_sha256':hashlib.sha256(r.content).hexdigest(),'xml_size':len(b),'decode_results':results,
+               'raw_first_lines_repr':[repr(x[:2000]) for x in lines[:12]]}
+          p=Path('encoding_audit.json'); p.write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('SUMMARY_SHA',hashlib.sha256(p.read_bytes()).hexdigest())
           PY
-      - name: Upload relation audit
+      - name: Upload encoding audit
         uses: actions/upload-artifact@v4
         with:
-          name: transit-future-n02-gml-relation-audit
-          path: relation_audit.json
+          name: transit-future-n02-xml-encoding-audit
+          path: encoding_audit.json
           if-no-files-found: error
           retention-days: 1
