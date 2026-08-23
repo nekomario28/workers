@@ -1,4 +1,4 @@
-name: Diagnostic Transit Future Census Mesh CSV Inspect
+name: Diagnostic Transit Future Population Pilot
 
 on:
   pull_request:
@@ -6,52 +6,176 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
-  inspect:
+  evaluate:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
-      - name: Inspect official e-Stat 2015 500m mesh CSV files
+      - name: Enrich 2020 gap pilot with cutoff-safe 2015 Census 500m population
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet 'requests==2.32.5'
-          mkdir -p out
+          mkdir -p out input
+          curl --fail --location --silent --show-error \
+            -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' \
+            'https://api.github.com/repos/nekomario28/workers/actions/artifacts/9488732799/zip' -o /tmp/labels.zip
+          unzip -q /tmp/labels.zip -d input
           python3 - <<'PY'
-          import csv,hashlib,io,requests
+          import csv, hashlib, io, json, math, os, statistics, zipfile
+          from collections import Counter
+          from concurrent.futures import ThreadPoolExecutor, as_completed
           from pathlib import Path
+          import requests
+
+          LABEL='input/transit_future_gap_labels_2020_2025_v1.csv'
+          rows=list(csv.DictReader(open(LABEL,encoding='utf-8')))
+          assert len(rows)==9677, len(rows)
           BASE='https://www.e-stat.go.jp/gis/statmap-search/data'
-          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0','Referer':'https://www.e-stat.go.jp/gis/statmap-search'})
-          for code in ['5339','5030']:
-            u=BASE; r=s.get(u,params={'statsId':'T000847','code':code,'downloadType':'2'},timeout=90,allow_redirects=True)
-            print('FETCH',code,r.status_code,len(r.content),r.url,r.headers.get('content-type'),r.headers.get('content-disposition'))
-            r.raise_for_status(); Path(f'out/{code}.bin').write_bytes(r.content)
-            print('SHA',code,hashlib.sha256(r.content).hexdigest(),'SIG',r.content[:16])
-            # CSV endpoint may return raw CSV or a ZIP; inspect both.
-            data=r.content
-            if data[:2]==b'PK':
-              import zipfile
-              z=zipfile.ZipFile(io.BytesIO(data)); print('ZIP',code,z.namelist())
-              for n in z.namelist():
-                b=z.read(n); Path(f'out/{code}_{Path(n).name}').write_bytes(b)
-                print('ZIPFILE',code,n,len(b),hashlib.sha256(b).hexdigest(),b[:20])
-                if n.lower().endswith(('.csv','.txt')): data=b; break
-            # Try common Japanese encodings and print first 8 parsed rows.
-            for enc in ['cp932','shift_jis','utf-8-sig','utf-8']:
+
+          def mesh500_code(lat,lon):
+            p=int(math.floor(lat*1.5)); q=int(math.floor(lon))-100
+            lat1=lat*1.5-p; lon1=lon-math.floor(lon)
+            r=int(math.floor(lat1*8)); s=int(math.floor(lon1*8))
+            lat2=lat1*8-r; lon2=lon1*8-s
+            t=int(math.floor(lat2*10)); u=int(math.floor(lon2*10))
+            lat3=lat2*10-t; lon3=lon2*10-u
+            hrow=1 if lat3>=0.5 else 0; hcol=1 if lon3>=0.5 else 0
+            h=1+hcol+2*hrow
+            return f'{p:02d}{q:02d}{r}{s}{t}{u}{h}'
+          def mesh500_center(code):
+            p=int(code[:2]); q=int(code[2:4]); r=int(code[4]); s=int(code[5]); t=int(code[6]); u=int(code[7]); h=int(code[8])
+            hrow=1 if h in ('3','4') else 0; hcol=1 if h in ('2','4') else 0
+            lat=p/1.5+r*(5/60)+t*(30/3600)+hrow*(15/3600)+(7.5/3600)
+            lon=q+100+s*(7.5/60)+u*(45/3600)+hcol*(22.5/3600)+(11.25/3600)
+            return lat,lon
+          def neighbors9(code):
+            lat,lon=mesh500_center(code); out=[]
+            for dy in (-1,0,1):
+              for dx in (-1,0,1): out.append(mesh500_code(lat+dy*(15/3600),lon+dx*(22.5/3600)))
+            return out
+
+          required=set()
+          for r in rows:
+            c=mesh500_code(float(r['endpoint_centroid_lat']),float(r['endpoint_centroid_lon']))
+            for n in neighbors9(c): required.add(n[:4])
+          print('REQUIRED_FIRST_MESH',len(required),sorted(required))
+          assert 80 <= len(required) <= 120
+
+          def fetch(code):
+            s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0','Referer':'https://www.e-stat.go.jp/gis/statmap-search'})
+            q=s.get(BASE,params={'statsId':'T000847','code':code,'downloadType':'2'},timeout=120); q.raise_for_status()
+            if q.content[:2]!=b'PK': raise RuntimeError(f'{code}: not zip')
+            z=zipfile.ZipFile(io.BytesIO(q.content)); names=[n for n in z.namelist() if n.lower().endswith(('.txt','.csv'))]
+            if len(names)!=1: raise RuntimeError(f'{code}: files={z.namelist()}')
+            b=z.read(names[0]); text=b.decode('cp932'); rd=list(csv.reader(io.StringIO(text)))
+            if len(rd)<2 or rd[0][:5] != ['KEY_CODE','HTKSYORI','HTKSAKI','GASSAN','T000847001']:
+              raise RuntimeError(f'{code}: schema mismatch {rd[:2]}')
+            d={}; suppressed=0
+            for x in rd[2:]:
+              if not x or not x[0]: continue
+              v=x[4].strip() if len(x)>4 else ''
+              if v in ('','*','X','-'):
+                d[x[0]]=None; suppressed+=1
+              else:
+                try:d[x[0]]=int(float(v))
+                except Exception: raise RuntimeError(f'{code} bad population {x[0]}={v!r}')
+            meta={'first_mesh':code,'url':q.url,'raw_zip_sha256':hashlib.sha256(q.content).hexdigest(),'raw_zip_bytes':len(q.content),'inner_name':names[0],'inner_sha256':hashlib.sha256(b).hexdigest(),'records':len(rd)-2,'suppressed_population_cells':suppressed}
+            return code,d,meta
+
+          pop={}; manifest=[]; errors=[]
+          with ThreadPoolExecutor(max_workers=8) as ex:
+            fs={ex.submit(fetch,c):c for c in sorted(required)}
+            for i,f in enumerate(as_completed(fs),1):
+              c=fs[f]
               try:
-                text=data.decode(enc); print('ENCODING',code,enc); break
-              except Exception: pass
-            else: raise SystemExit(f'cannot decode {code}')
-            Path(f'out/{code}_decoded.txt').write_text(text,encoding='utf-8')
-            rd=csv.reader(io.StringIO(text))
-            for i,row in zip(range(10),rd): print('ROW',code,i,row[:80])
+                code,d,m=f.result(); pop.update(d); manifest.append(m)
+                if i%10==0: print('FETCH_PROGRESS',i,'of',len(required),'population_cells',len(pop))
+              except Exception as e: errors.append((c,repr(e))); print('FETCH_ERROR',c,repr(e))
+          if errors: raise SystemExit(f'population downloads failed: {errors}')
+          manifest.sort(key=lambda x:x['first_mesh']); Path('out/population_source_manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('POP_CELLS',len(pop),'MANIFEST',len(manifest),'SUPPRESSED',sum(x['suppressed_population_cells'] for x in manifest))
+
+          enriched=[]; status_counts=Counter(); cens500=0; cens3=0
+          for r in rows:
+            c=mesh500_code(float(r['endpoint_centroid_lat']),float(r['endpoint_centroid_lon']))
+            ns=neighbors9(c)
+            v=pop.get(c,0)
+            vals=[pop.get(n,0) for n in ns]
+            if v is None: cens500+=1
+            if any(x is None for x in vals): cens3+=1
+            pop3=None if any(x is None for x in vals) else sum(vals)
+            x=dict(r); x['mesh500_code_2015']=c; x['pop500_midpoint_2015']='' if v is None else v; x['pop3x3_2015']='' if pop3 is None else pop3
+            x['population_suppressed_midpoint']=str(v is None); x['population_suppressed_3x3']=str(pop3 is None)
+            enriched.append(x); status_counts[r['label_status_v1']]+=1
+          out='out/transit_future_gap_labels_2020_2025_pop2015.csv'
+          cols=list(enriched[0].keys())
+          with open(out,'w',encoding='utf-8',newline='') as f:
+            w=csv.DictWriter(f,fieldnames=cols); w.writeheader(); w.writerows(enriched)
+          csv_sha=hashlib.sha256(Path(out).read_bytes()).hexdigest()
+
+          evalrows=[x for x in enriched if x['label_status_v1'] in ('positive','negative') and x['pop3x3_2015']!='' and x['pop500_midpoint_2015']!='']
+          positives=sum(x['label_status_v1']=='positive' for x in evalrows)
+          assert positives>0
+          def avg_rank01(vals):
+            order=sorted(range(len(vals)),key=lambda i:vals[i]); ans=[0.0]*len(vals); i=0; n=len(vals)
+            while i<n:
+              j=i+1
+              while j<n and vals[order[j]]==vals[order[i]]: j+=1
+              av=(i+j-1)/2
+              q=0.5 if n==1 else av/(n-1)
+              for k in range(i,j): ans[order[k]]=q
+              i=j
+            return ans
+          gap=[math.log1p(float(x['gap_length_m'])) for x in evalrows]
+          p500=[math.log1p(float(x['pop500_midpoint_2015'])) for x in evalrows]
+          p3=[math.log1p(float(x['pop3x3_2015'])) for x in evalrows]
+          rg=avg_rank01(gap); r500=avg_rank01(p500); r3=avg_rank01(p3)
+          scores={
+            'gap_only':rg,
+            'pop500_only':r500,
+            'pop3x3_only':r3,
+            'fixed_equal_rank_gap_pop3x3':[0.5*a+0.5*b for a,b in zip(rg,r3)],
+          }
+          y=[1 if x['label_status_v1']=='positive' else 0 for x in evalrows]
+          keys=[(x['operator'],x['line'],x['station_a'],x['station_b']) for x in evalrows]
+          def average_precision_tie_group(score):
+            groups={}
+            for s,yy in zip(score,y):
+              a=groups.setdefault(s,[0,0]); a[0]+=yy; a[1]+=1
+            tp=0; seen=0; ap=0.0
+            for s in sorted(groups,reverse=True):
+              pos,n=groups[s]; tp+=pos; seen+=n
+              if pos: ap += (pos/positives)*(tp/seen)
+            return ap
+          def top(score,k):
+            idx=sorted(range(len(score)),key=lambda i:(-score[i],keys[i]))[:k]
+            hits=sum(y[i] for i in idx); return {'k':k,'hits':hits,'precision':hits/k,'recall':hits/positives}
+          metrics={}
+          for name,score in scores.items():
+            metrics[name]={'average_precision_tie_group':average_precision_tie_group(score),'top17':top(score,17),'top50':top(score,50),'top100':top(score,100),'top1pct':top(score,max(1,int(len(score)*.01))),'top5pct':top(score,max(1,int(len(score)*.05))),'unique_scores':len(set(score))}
+            print('METRIC',name,json.dumps(metrics[name],ensure_ascii=False))
+          summary={
+            'pilot_warning':'Uses N02-2020 predictor universe, which is not strict point-in-time for calendar 2020; structural pilot only.',
+            'population_source':'2015 Census 500m mesh T000847, published 2017-06-27',
+            'population_value_field':'T000847001 population total',
+            'required_first_mesh_files':len(required),'population_cells_loaded':len(pop),
+            'population_suppressed_midpoint_rows':cens500,'population_suppressed_3x3_rows':cens3,
+            'label_status_counts':dict(status_counts),'evaluation_rows':len(evalrows),'positives':positives,
+            'fixed_strict_combo_formula':'0.5 * percentile-rank(log1p(gap_length_m)) + 0.5 * percentile-rank(log1p(pop3x3_2015)); exact equal weights frozen before strict N02-2019 answer join',
+            'metrics':metrics,'enriched_csv_sha256':csv_sha
+          }
+          Path('out/population_pilot_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('GATE',json.dumps(summary,ensure_ascii=False))
           PY
           sha256sum out/*
-      - name: Upload CSV inspection
+      - name: Upload population-enriched pilot
         uses: actions/upload-artifact@v4
         with:
-          name: transit-future-census-mesh-csv-inspect
+          name: transit-future-population-pilot
           path: out/
           if-no-files-found: error
           retention-days: 2
