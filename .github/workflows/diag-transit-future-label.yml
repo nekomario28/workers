@@ -1,4 +1,4 @@
-name: Diagnostic Transit Future Official BRT Mask
+name: Diagnostic Transit Future N02 GML Relation Audit
 
 on:
   pull_request:
@@ -6,86 +6,57 @@ on:
 
 permissions:
   contents: read
-  actions: read
 
 jobs:
   audit:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Mask non-rail BRT positives using captured official operator inventory
+      - name: Inspect 2020 N02 GML station-section relations
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p input out
-          curl --fail --location --silent --show-error \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
-            'https://api.github.com/repos/nekomario28/workers/actions/artifacts/9488546830/zip' \
-            -o /tmp/v2.zip
-          unzip -q /tmp/v2.zip -d input
           python3 - <<'PY'
-          import csv, hashlib, json, unicodedata
-          from collections import Counter
+          import hashlib, io, json, requests, zipfile, xml.etree.ElementTree as ET
           from pathlib import Path
-
-          SRC=Path('input/transit_future_positive_labels_v2.csv')
-          SRC_SHA='1beb73425ab6f1f89e4e7e02d962c20e4c7fdbc150fb0592d69d560b05eb3eab'
-          if hashlib.sha256(SRC.read_bytes()).hexdigest()!=SRC_SHA: raise SystemExit('v2 SHA mismatch')
-          rows=list(csv.DictReader(SRC.open(encoding='utf-8')))
-          def norm(x): return ''.join(unicodedata.normalize('NFKC',str(x or '')).split())
-
-          # Official JR East source captured independently because the provider returns HTTP 403 to
-          # GitHub-hosted runners. Source page explicitly labels these as BRT stations, separate from rail.
-          source_url='https://www.jreast.co.jp/passenger/2015_brt.html'
-          source_capture='JR East official 2015 BRT station ridership inventory; web-verified 2026-08-23'
-          brt_names={norm(x) for x in [
-            # Kesennuma Line BRT
-            '前谷地','柳津','陸前横山','陸前戸倉','志津川','ベイサイドアリーナ','清水浜','歌津','陸前港','蔵内',
-            '陸前小泉','本吉','小金沢','大谷海岸','陸前階上','最知','松岩','南気仙沼','不動の沢','気仙沼',
-            # Ofunato Line BRT
-            '鹿折唐桑','長部','陸前矢作','奇跡の一本松','竹駒','陸前高田','高田高校前','高田病院','脇ノ沢','小友',
-            '碁石海岸口','細浦','下船渡','大船渡魚市場前','大船渡','盛'
-          ]}
-
-          out=[]; masked=[]; counts=Counter()
-          for c in rows:
-            prev=(c['final_positive_v2']=='True')
-            relevant_route=('東日本旅客鉄道/大船渡線' in c['future_operator_lines'] or
-                            '東日本旅客鉄道/気仙沼線' in c['future_operator_lines'])
-            is_brt=(norm(c['future_station']) in brt_names and relevant_route)
-            final=prev and not is_brt
-            if prev and is_brt:
-              masked.append({'station':c['future_station'],'class':c['class'],'from_year':c['from_year'],'to_year':c['to_year'],'future_operator_lines':c['future_operator_lines']})
-            if final: counts[c['class']]+=1
-            out.append({**c,'official_brt_mask':is_brt,'final_positive_v3':final,
-                        'final_positive_reason_v3':'official_brt_excluded' if prev and is_brt else c['final_positive_reason_v2']})
-
-          fields=list(rows[0].keys())+['official_brt_mask','final_positive_v3','final_positive_reason_v3']
-          p=Path('out/transit_future_positive_labels_v3.csv')
-          with p.open('w',encoding='utf-8',newline='') as f:
-            w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(out)
-          summary={'input_v2_sha256':SRC_SHA,'official_brt_url':source_url,'official_brt_capture':source_capture,
-                   'runner_fetch_note':'direct provider fetch returned HTTP 403 in prior run 32621863352; inventory frozen from independently retrieved official page',
-                   'masked_positive_count':len(masked),'masked_positives':masked,
-                   'final_positive_by_class':dict(counts),'final_positive_total':sum(counts.values()),
-                   'csv_sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
-          q=Path('out/transit_future_positive_labels_v3_summary.json')
-          q.write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
-          print('MASKED',json.dumps(masked,ensure_ascii=False))
-          print('FINAL_POSITIVE_BY_CLASS',json.dumps(dict(counts),ensure_ascii=False))
-          print('FINAL_POSITIVE_TOTAL',sum(counts.values()))
-          print('CSV_SHA',summary['csv_sha256'])
-          if len(masked)!=7: raise SystemExit(f'expected 7 official BRT positives, got {len(masked)}')
+          u='https://nlftp.mlit.go.jp/ksj/gml/data/N02/N02-20/N02-20_GML.zip'
+          r=requests.get(u,headers={'User-Agent':'Mozilla/5.0'},timeout=120); r.raise_for_status()
+          print('RAW',len(r.content),hashlib.sha256(r.content).hexdigest())
+          z=zipfile.ZipFile(io.BytesIO(r.content)); names=z.namelist()
+          print('FILES',json.dumps(names[:80],ensure_ascii=False))
+          gmls=[n for n in names if n.lower().endswith(('.xml','.gml'))]
+          print('GML_FILES',gmls)
+          if not gmls: raise SystemExit('no GML/XML found')
+          target=max(gmls,key=lambda n: z.getinfo(n).file_size)
+          print('TARGET',target,z.getinfo(target).file_size)
+          sample={'RailroadSection':None,'Station':None}; counts={'RailroadSection':0,'Station':0}; child_tags={}
+          hrefs={'RailroadSection':[],'Station':[]}
+          XLINK='{http://www.w3.org/1999/xlink}href'
+          for ev,el in ET.iterparse(io.BytesIO(z.read(target)),events=('end',)):
+            local=el.tag.split('}')[-1]
+            if local in sample:
+              counts[local]+=1
+              if sample[local] is None:
+                sample[local]=ET.tostring(el,encoding='unicode')[:12000]
+                child_tags[local]=[c.tag.split('}')[-1] for c in list(el)]
+                for d in el.iter():
+                  if XLINK in d.attrib: hrefs[local].append((d.tag.split('}')[-1],d.attrib[XLINK]))
+              el.clear()
+          print('COUNTS',counts)
+          print('CHILD_TAGS',json.dumps(child_tags,ensure_ascii=False))
+          print('HREFS',json.dumps(hrefs,ensure_ascii=False))
+          print('RAILROAD_SAMPLE',sample['RailroadSection'])
+          print('STATION_SAMPLE',sample['Station'])
+          out={'source_url':u,'source_sha256':hashlib.sha256(r.content).hexdigest(),'gml_file':target,
+               'counts':counts,'child_tags':child_tags,'xlink_hrefs':hrefs,
+               'railroad_sample':sample['RailroadSection'],'station_sample':sample['Station']}
+          Path('relation_audit.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('SUMMARY_SHA',hashlib.sha256(Path('relation_audit.json').read_bytes()).hexdigest())
           PY
-          sha256sum out/*
-      - name: Upload BRT-masked label freeze
+      - name: Upload relation audit
         uses: actions/upload-artifact@v4
         with:
-          name: transit-future-positive-labels-v3
-          path: out/
+          name: transit-future-n02-gml-relation-audit
+          path: relation_audit.json
           if-no-files-found: error
           retention-days: 1
