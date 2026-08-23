@@ -1,0 +1,230 @@
+name: age-growth-fresh-source-freeze
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  freeze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download exact historical artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/demand /tmp/denom /tmp/out
+          curl --fail --silent --show-error --location \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/nekomario28/workers/actions/artifacts/9481762001/zip \
+            -o /tmp/demand.zip
+          curl --fail --silent --show-error --location \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/nekomario28/workers/actions/artifacts/9480653606/zip \
+            -o /tmp/denom.zip
+          unzip -q /tmp/demand.zip -d /tmp/demand
+          unzip -q /tmp/denom.zip -d /tmp/denom
+          echo '481c335fe5e5458c7751aec403c289e55cfeb3d0e2a81cc789eb043c00a21c0b  /tmp/demand/2020_age.xls' | sha256sum -c -
+          echo 'af485797942888ae6d6b6bc0d1777e791e8715cba5d83c3b117cec0fc6eac394  /tmp/demand/2021_age.xlsx' | sha256sum -c -
+          echo '73249e927cf4363b375b2fbdafc6d5c2466c566998cba4844b3c5b505c6cd35b  /tmp/denom/table1.xls' | sha256sum -c -
+
+      - name: Install legacy XLS reader
+        run: python -m pip install --disable-pip-version-check xlrd==2.0.2
+
+      - name: Freeze age-growth predictor and 2016 denominator
+        shell: bash
+        run: |
+          python - <<'PY'
+          import csv, hashlib, json, math, re, zipfile
+          from pathlib import Path
+          from xml.etree import ElementTree as ET
+          import xlrd
+
+          OUT = Path('/tmp/out')
+          NS = {'m': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
+                'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+                'pr': 'http://schemas.openxmlformats.org/package/2006/relationships'}
+
+          regions = [
+              ('01101','札幌市中央区','Sapporo'),('01102','札幌市北区','Sapporo'),
+              ('01103','札幌市東区','Sapporo'),('01104','札幌市白石区','Sapporo'),
+              ('01105','札幌市豊平区','Sapporo'),('01106','札幌市南区','Sapporo'),
+              ('01107','札幌市西区','Sapporo'),('01108','札幌市厚別区','Sapporo'),
+              ('01109','札幌市手稲区','Sapporo'),('01110','札幌市清田区','Sapporo'),
+              ('28101','神戸市東灘区','Kobe'),('28102','神戸市灘区','Kobe'),
+              ('28105','神戸市兵庫区','Kobe'),('28106','神戸市長田区','Kobe'),
+              ('28107','神戸市須磨区','Kobe'),('28108','神戸市垂水区','Kobe'),
+              ('28109','神戸市北区','Kobe'),('28110','神戸市中央区','Kobe'),
+              ('28111','神戸市西区','Kobe'),
+              ('26101','京都市北区','Kyoto'),('26102','京都市上京区','Kyoto'),
+              ('26103','京都市左京区','Kyoto'),('26104','京都市中京区','Kyoto'),
+              ('26105','京都市東山区','Kyoto'),('26106','京都市下京区','Kyoto'),
+              ('26107','京都市南区','Kyoto'),('26108','京都市右京区','Kyoto'),
+              ('26109','京都市伏見区','Kyoto'),('26110','京都市山科区','Kyoto'),
+              ('26111','京都市西京区','Kyoto')]
+          if len(regions) != 30 or len({r[0] for r in regions}) != 30:
+              raise SystemExit('invalid region universe')
+
+          def norm_code(v):
+              if v is None: return None
+              s = str(v).strip()
+              if s.endswith('.0'): s = s[:-2]
+              d = re.sub(r'\D', '', s)
+              if not d: return None
+              d = d.zfill(6)
+              return d[:5]
+
+          def xls_age(path):
+              wb = xlrd.open_workbook(path, on_demand=True)
+              sh = wb.sheet_by_index(0)
+              out = {}
+              for i in range(sh.nrows):
+                  code = norm_code(sh.cell_value(i,0))
+                  sex = str(sh.cell_value(i,3)).strip() if sh.ncols > 3 else ''
+                  if not code or sex != '計' or sh.ncols <= 10: continue
+                  try:
+                      a = float(sh.cell_value(i,9)); b = float(sh.cell_value(i,10))
+                  except Exception:
+                      continue
+                  if math.isfinite(a) and math.isfinite(b): out[code] = a+b
+              wb.release_resources()
+              return out
+
+          def col_index(ref):
+              letters = re.match(r'[A-Z]+', ref).group(0)
+              n = 0
+              for ch in letters: n = n*26 + (ord(ch)-64)
+              return n-1
+
+          def xlsx_rows(path):
+              with zipfile.ZipFile(path) as z:
+                  shared = []
+                  if 'xl/sharedStrings.xml' in z.namelist():
+                      root = ET.fromstring(z.read('xl/sharedStrings.xml'))
+                      for si in root.findall('m:si', NS):
+                          shared.append(''.join(t.text or '' for t in si.iter('{%s}t' % NS['m'])))
+                  wb = ET.fromstring(z.read('xl/workbook.xml'))
+                  first = wb.find('m:sheets/m:sheet', NS)
+                  rid = first.attrib['{%s}id' % NS['r']]
+                  rels = ET.fromstring(z.read('xl/_rels/workbook.xml.rels'))
+                  target = None
+                  for rel in rels.findall('pr:Relationship', NS):
+                      if rel.attrib.get('Id') == rid:
+                          target = rel.attrib['Target']; break
+                  if not target: raise SystemExit('xlsx sheet relation missing')
+                  sheet_path = target.lstrip('/') if target.startswith('/xl/') else 'xl/' + target.lstrip('/')
+                  root = ET.fromstring(z.read(sheet_path))
+                  for row in root.findall('.//m:sheetData/m:row', NS):
+                      vals = {}
+                      for c in row.findall('m:c', NS):
+                          idx = col_index(c.attrib['r']); typ = c.attrib.get('t')
+                          if typ == 'inlineStr':
+                              node = c.find('m:is', NS)
+                              val = ''.join(t.text or '' for t in node.iter('{%s}t' % NS['m'])) if node is not None else ''
+                          else:
+                              v = c.find('m:v', NS); raw = v.text if v is not None else None
+                              if raw is None: val = None
+                              elif typ == 's': val = shared[int(raw)]
+                              else:
+                                  try: val = float(raw)
+                                  except Exception: val = raw
+                          vals[idx] = val
+                      yield vals
+
+          def xlsx_age(path):
+              out = {}
+              for row in xlsx_rows(path):
+                  code = norm_code(row.get(0)); sex = str(row.get(3,'')).strip()
+                  if not code or sex != '計': continue
+                  try: a=float(row[9]); b=float(row[10])
+                  except Exception: continue
+                  if math.isfinite(a) and math.isfinite(b): out[code]=a+b
+              return out
+
+          age20 = xls_age('/tmp/demand/2020_age.xls')
+          age21 = xlsx_age('/tmp/demand/2021_age.xlsx')
+          def growth(code):
+              if code not in age20 or code not in age21 or age20[code] == 0: raise KeyError(code)
+              return (age21[code]-age20[code])/age20[code]*100.0
+
+          age_checks = {
+              '27127': 4.227660796039852,
+              '27128': 2.3763643100897177,
+              '23106': 1.4963272893710792,
+              '23112': -3.084607549507896,
+          }
+          age_errors = {c: abs(growth(c)-v) for c,v in age_checks.items()}
+          if max(age_errors.values()) > 1e-10:
+              raise SystemExit('age parser reference mismatch '+repr(age_errors))
+
+          pred = [(code,name,metro,growth(code)) for code,name,metro in regions]
+
+          denom_refs = {'27102':4981,'27128':31316,'23101':7324,'23106':20983}
+          targets = {r[0] for r in regions} | set(denom_refs)
+          wb = xlrd.open_workbook('/tmp/denom/table1.xls', on_demand=True)
+          candidates = []
+          for sidx in range(wb.nsheets):
+              sh = wb.sheet_by_index(sidx)
+              rows = {}
+              for i in range(sh.nrows):
+                  found = None
+                  for j in range(min(8,sh.ncols)):
+                      c = norm_code(sh.cell_value(i,j))
+                      if c in targets: found=c; break
+                  if found: rows[found]=i
+              if not set(denom_refs).issubset(rows): continue
+              for col in range(sh.ncols):
+                  ok = True
+                  for code,val in denom_refs.items():
+                      try: num=float(str(sh.cell_value(rows[code],col)).replace(',',''))
+                      except Exception: ok=False; break
+                      if abs(num-val) > 1e-9: ok=False; break
+                  if ok: candidates.append((sidx,col,rows))
+          if len(candidates) != 1:
+              raise SystemExit('denominator reference column not unique: '+repr([(a,b) for a,b,_ in candidates]))
+          sidx,col,rows = candidates[0]; sh=wb.sheet_by_index(sidx)
+          denom=[]
+          for code,name,metro in regions:
+              if code not in rows: raise SystemExit('missing denominator row '+code)
+              val=int(round(float(str(sh.cell_value(rows[code],col)).replace(',',''))))
+              if val <= 0: raise SystemExit('invalid denominator '+code)
+              denom.append((code,name,metro,val))
+          sheet_name=sh.name; wb.release_resources()
+
+          p1=OUT/'age_growth_fresh_spatial_holdout_2022_predictor_30regions.csv'
+          with p1.open('w',encoding='utf-8',newline='') as f:
+              w=csv.writer(f,lineterminator='\n'); w.writerow(['region_code','region_name','metro','age20_29_growth_2020_to_2021_pct']); w.writerows(pred)
+          p2=OUT/'establishments_2016_age_growth_fresh_spatial_holdout_30regions.csv'
+          with p2.open('w',encoding='utf-8',newline='') as f:
+              w=csv.writer(f,lineterminator='\n'); w.writerow(['region_code','region_name','metro','private_establishments_2016']); w.writerows(denom)
+          def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
+          meta={
+            'status':'FROZEN_BEFORE_OUTCOME_RETRIEVAL',
+            'canonical_preregistration_boundary':'f6b8e89d55f29f5f637fd52a58a08f598c8b7ff2',
+            'transport_repository':'nekomario28/workers',
+            'source_artifact_ids':{'demand':9481762001,'denominator':9480653606},
+            'regions':{'total':30,'Sapporo':10,'Kobe':9,'Kyoto':11},
+            'predictor':'age20_29_growth_2020_to_2021_pct',
+            'source_sha256':{'2020_age':'481c335fe5e5458c7751aec403c289e55cfeb3d0e2a81cc789eb043c00a21c0b','2021_age':'af485797942888ae6d6b6bc0d1777e791e8715cba5d83c3b117cec0fc6eac394','denominator_2016':'73249e927cf4363b375b2fbdafc6d5c2466c566998cba4844b3c5b505c6cd35b'},
+            'validation':{'age_reference_checks':age_checks,'age_max_abs_error':max(age_errors.values()),'denominator_reference_checks':denom_refs,'denominator_sheet':sheet_name,'denominator_column_zero_based':col},
+            'files':{p1.name:sha(p1),p2.name:sha(p2)},'outcome_retrieved':False,'zero_fill':False}
+          p3=OUT/'age_growth_fresh_spatial_holdout_2022_source_freeze_meta.json'
+          p3.write_text(json.dumps(meta,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+          print(json.dumps(meta,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Upload fresh source freeze
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: age-growth-fresh-source-freeze
+          path: /tmp/out/
+          if-no-files-found: error
+          retention-days: 2
