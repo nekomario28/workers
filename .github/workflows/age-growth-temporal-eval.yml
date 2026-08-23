@@ -1,0 +1,51 @@
+name: age-growth-temporal-eval
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact transport head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Download pre-frozen temporal outcome source bytes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/source /tmp/out
+          curl --fail --silent --show-error --location \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/nekomario28/workers/actions/artifacts/9496145830/zip \
+            -o /tmp/source.zip
+          unzip -q /tmp/source.zip -d /tmp/source
+          echo 'dc7a7197aa40a600752b20fc218268523cde9148f85caaae69b31b0398f3996a  /tmp/source/FY2024_7-2_apr-dec.xls' | sha256sum -c -
+          echo 'a5217bdf9873ca4188a98a6e13bb34c62bffb02d7e0c4d0691053a231bec08d8  /tmp/source/FY2024_7-2-2_jan-mar.xls' | sha256sum -c -
+          echo '6dd12e3315b77ae67688839b789e046d52e29826b2b5c8312fa339581686a1a9  /tmp/source/FY2025_7-2-2_full-year.xls' | sha256sum -c -
+
+      - name: Install pinned evaluation readers
+        run: python -m pip install --disable-pip-version-check xlrd==2.0.2 numpy==2.3.2
+
+      - name: Parse and evaluate preregistered temporal revalidation once
+        run: python scripts/age_growth_temporal_eval.py
+
+      - name: Upload temporal revalidation evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: age-growth-temporal-eval
+          path: /tmp/out/
+          if-no-files-found: error
+          retention-days: 2
