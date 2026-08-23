@@ -1,4 +1,4 @@
-name: Diagnostic Transit Future 2020 Gap Mapping
+name: Diagnostic Transit Future 2020 Gap Universe
 
 on:
   pull_request:
@@ -11,9 +11,9 @@ permissions:
 jobs:
   audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
-      - name: Build official-relation station gaps for 17 positive service groups
+      - name: Freeze nationwide station-gap candidates and gap-length baseline
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -21,23 +21,23 @@ jobs:
           set -euo pipefail
           mkdir -p input out
           curl --fail --location --silent --show-error \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
-            'https://api.github.com/repos/nekomario28/workers/actions/artifacts/9488593216/zip' \
-            -o /tmp/v3.zip
-          unzip -q /tmp/v3.zip -d input
+            -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' \
+            'https://api.github.com/repos/nekomario28/workers/actions/artifacts/9488683985/zip' -o /tmp/map.zip
+          unzip -q /tmp/map.zip -d input
           python3 - <<'PY'
           import csv, hashlib, heapq, io, json, math, requests, unicodedata, zipfile, xml.etree.ElementTree as ET
           from collections import defaultdict
           from pathlib import Path
 
-          LABEL=Path('input/transit_future_positive_labels_v3.csv')
-          LABEL_SHA='337715abd92a13338c5544d5b5a863cf7e61e74ea14e66a6eb58687ae432106e'
-          if hashlib.sha256(LABEL.read_bytes()).hexdigest()!=LABEL_SHA: raise SystemExit('v3 SHA mismatch')
-          positives=[r for r in csv.DictReader(LABEL.open(encoding='utf-8'))
-                     if r['from_year']=='2020' and r['to_year']=='2025' and r['class']=='existing_line_infill_candidate' and r['final_positive_v3']=='True']
-          if len(positives)!=17: raise SystemExit(f'expected 17 positives, got {len(positives)}')
+          MAP=Path('input/transit_future_2020_positive_gap_mapping.json')
+          MAP_SHA='1eb1ff824a7b0563f904cd3c66be0fffb26fb4fd74274d7010142afef5aa0891'
+          if hashlib.sha256(MAP.read_bytes()).hexdigest()!=MAP_SHA: raise SystemExit('positive gap mapping SHA mismatch')
+          mp=json.loads(MAP.read_text(encoding='utf-8'))
+          pos_keys=set()
+          for x in mp['mappings']:
+            op,line=x['service'].split('/',1); a,b=sorted([unicodedata.normalize('NFKC',x['left_station']).replace(' ',''),unicodedata.normalize('NFKC',x['right_station']).replace(' ','')])
+            pos_keys.add((unicodedata.normalize('NFKC',op).replace(' ',''),unicodedata.normalize('NFKC',line).replace(' ',''),a,b))
+          if len(pos_keys)!=17: raise SystemExit('expected 17 unique positive gap keys')
 
           u='https://nlftp.mlit.go.jp/ksj/gml/data/N02/N02-20/N02-20_GML.zip'
           rr=requests.get(u,headers={'User-Agent':'Mozilla/5.0'},timeout=120); rr.raise_for_status()
@@ -45,38 +45,30 @@ jobs:
           GML='{http://www.opengis.net/gml/3.2}'; XLINK='{http://www.w3.org/1999/xlink}href'
           def loc(t): return t.split('}')[-1]
           def norm(x): return ''.join(unicodedata.normalize('NFKC',str(x or '')).split())
-          def child_text(el,name):
+          def ct(el,name):
             for c in el:
               if loc(c.tag)==name: return (c.text or '').strip()
             return ''
-          def child_href(el,name):
+          def ch(el,name):
             for c in el:
               if loc(c.tag)==name: return c.attrib.get(XLINK,'').lstrip('#')
             return ''
           def hav(a,b):
-            lat1,lon1=a; lat2,lon2=b; R=6371000.0
-            p1=math.radians(lat1); p2=math.radians(lat2); dp=math.radians(lat2-lat1); dl=math.radians(lon2-lon1)
-            q=math.sin(dp/2)**2+math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+            lat1,lon1=a; lat2,lon2=b; R=6371000.; p1=math.radians(lat1); p2=math.radians(lat2)
+            dp=math.radians(lat2-lat1); dl=math.radians(lon2-lon1); q=math.sin(dp/2)**2+math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
             return 2*R*math.asin(min(1,math.sqrt(q)))
-          def project_point(p,pts):
-            lat,lon=p; R=6371000.; cl=math.cos(math.radians(lat)); best=None; cum=0.; total=0.; seglens=[]
-            for a,b in zip(pts,pts[1:]):
-              L=hav(a,b); seglens.append(L); total+=L
-            for idx,(a,b) in enumerate(zip(pts,pts[1:])):
-              ax=math.radians(a[1]-lon)*R*cl; ay=math.radians(a[0]-lat)*R
-              bx=math.radians(b[1]-lon)*R*cl; by=math.radians(b[0]-lat)*R
-              vx=bx-ax; vy=by-ay; den=vx*vx+vy*vy
-              t=0. if den<=1e-12 else max(0.,min(1.,-(ax*vx+ay*vy)/den))
-              qx=ax+t*vx; qy=ay+t*vy; d=math.hypot(qx,qy)
-              along=cum+t*seglens[idx]
-              proj=(a[0]+t*(b[0]-a[0]),a[1]+t*(b[1]-a[1]))
-              if best is None or d<best[0]: best=(d,along,total,proj,idx,t)
-              cum+=seglens[idx]
-            if len(pts)==1: return (hav(p,pts[0]),0.,0.,pts[0],0,0.)
-            return best
+          def project(p,pts):
+            lat,lon=p; R=6371000.; cl=math.cos(math.radians(lat)); best=None; cum=0.; lens=[hav(a,b) for a,b in zip(pts,pts[1:])]
+            for i,(a,b) in enumerate(zip(pts,pts[1:])):
+              ax=math.radians(a[1]-lon)*R*cl; ay=math.radians(a[0]-lat)*R; bx=math.radians(b[1]-lon)*R*cl; by=math.radians(b[0]-lat)*R
+              vx=bx-ax; vy=by-ay; den=vx*vx+vy*vy; t=0. if den<=1e-12 else max(0.,min(1.,-(ax*vx+ay*vy)/den))
+              d=math.hypot(ax+t*vx,ay+t*vy); along=cum+t*lens[i]
+              if best is None or d<best[0]: best=(d,along)
+              cum+=lens[i]
+            return best or (hav(p,pts[0]),0.)
 
           curves={}; sections={}; stations=[]
-          for ev,el in ET.iterparse(io.StringIO(s),events=('end',)):
+          for _,el in ET.iterparse(io.StringIO(s),events=('end',)):
             name=loc(el.tag)
             if name=='Curve':
               gid=el.attrib.get(GML+'id',''); pos=None
@@ -86,140 +78,101 @@ jobs:
                 vals=[float(x) for x in pos.split()]; curves[gid]=[(vals[i],vals[i+1]) for i in range(0,len(vals)-1,2)]
               el.clear()
             elif name=='RailroadSection':
-              sid=el.attrib.get(GML+'id',''); sections[sid]={'curve':child_href(el,'location'),'type':child_text(el,'railwayType'),
-                'line':norm(child_text(el,'railwayLineName')),'op':norm(child_text(el,'operationCompany'))}; el.clear()
+              sid=el.attrib.get(GML+'id',''); sections[sid]={'curve':ch(el,'location'),'type':ct(el,'railwayType'),'provider':ct(el,'serviceProviderType'),'line':norm(ct(el,'railwayLineName')),'op':norm(ct(el,'operationCompany'))}; el.clear()
             elif name=='Station':
-              stations.append({'id':el.attrib.get(GML+'id',''),'curve':child_href(el,'location'),'section':child_href(el,'railroadSection'),
-                'type':child_text(el,'railwayType'),'line':norm(child_text(el,'railwayLineName')),'op':norm(child_text(el,'operationCompany')),
-                'name':child_text(el,'stationName')}); el.clear()
-
-          # Attach center point to every cutoff station.
+              stations.append({'id':el.attrib.get(GML+'id',''),'curve':ch(el,'location'),'section':ch(el,'railroadSection'),'type':ct(el,'railwayType'),'provider':ct(el,'serviceProviderType'),'line':norm(ct(el,'railwayLineName')),'op':norm(ct(el,'operationCompany')),'name':ct(el,'stationName')}); el.clear()
           for st in stations:
-            sp=curves[st['curve']]; st['point']=((min(x[0] for x in sp)+max(x[0] for x in sp))/2,
-                                                 (min(x[1] for x in sp)+max(x[1] for x in sp))/2)
+            sp=curves[st['curve']]; st['point']=((min(p[0] for p in sp)+max(p[0] for p in sp))/2,(min(p[1] for p in sp)+max(p[1] for p in sp))/2)
           bygroup=defaultdict(list)
-          for st in stations: bygroup[(st['op'],st['line'])].append(st)
+          for st in stations:
+            if st['op'] and st['line']: bygroup[(st['op'],st['line'])].append(st)
 
-          # Fixed target service identity: if future station belongs to multiple services, choose only services already present at cutoff.
-          pentries=[]; target_groups=set()
-          for p in positives:
-            pairs=[]
-            for token in p['future_operator_lines'].split(';'):
-              if '/' in token:
-                op,line=token.split('/',1); q=(norm(op),norm(line))
-                if q in bygroup: pairs.append(q); target_groups.add(q)
-            if not pairs: raise SystemExit(f'no cutoff service for {p["future_station"]}')
-            pentries.append((p,pairs))
+          brt={norm(x) for x in ['前谷地','柳津','陸前横山','陸前戸倉','志津川','ベイサイドアリーナ','清水浜','歌津','陸前港','蔵内','陸前小泉','本吉','小金沢','大谷海岸','陸前階上','最知','松岩','南気仙沼','不動の沢','気仙沼','鹿折唐桑','長部','陸前矢作','奇跡の一本松','竹駒','陸前高田','高田高校前','高田病院','脇ノ沢','小友','碁石海岸口','細浦','下船渡','大船渡魚市場前','大船渡','盛']}
 
-          def build_group(group):
-            gst=bygroup[group]
-            # Include canonical service sections plus any official linked sections referenced by this service's stations.
-            sec_ids={sid for sid,sec in sections.items() if (sec['op'],sec['line'])==group}
-            sec_ids.update(st['section'] for st in gst)
-            sec_ids={sid for sid in sec_ids if sid in sections and sections[sid]['curve'] in curves}
+          def build(group,gst):
+            sec_ids={sid for sid,sec in sections.items() if (sec['op'],sec['line'])==group and sec['curve'] in curves}
+            sec_ids.update(st['section'] for st in gst if st['section'] in sections and sections[st['section']]['curve'] in curves)
             assigned=defaultdict(list)
             for st in gst:
-              if st['section'] not in sec_ids: raise RuntimeError('station linked section absent')
-              pts=curves[sections[st['section']]['curve']]; pr=project_point(st['point'],pts)
-              assigned[st['section']].append((pr[1],st))
-            graph=defaultdict(list); station_nodes={}; section_chains={}; edge_count=0
-            def pnode(pt): return ('p',round(pt[0],8),round(pt[1],8))
+              pts=curves[sections[st['section']]['curve']]; assigned[st['section']].append((project(st['point'],pts)[1],st))
+            graph=defaultdict(list); snodes={}; nodepoint={}; edges=[]
+            def pn(p): return ('p',round(p[0],8),round(p[1],8))
             for sid in sec_ids:
               pts=curves[sections[sid]['curve']]
               if len(pts)<2: continue
-              total=sum(hav(a,b) for a,b in zip(pts,pts[1:]))
-              marks=[(0.,pnode(pts[0]),None),(total,pnode(pts[-1]),None)]
+              total=sum(hav(a,b) for a,b in zip(pts,pts[1:])); marks=[(0.,pn(pts[0]),pts[0]),(total,pn(pts[-1]),pts[-1])]
+              nodepoint[pn(pts[0])]=pts[0]; nodepoint[pn(pts[-1])]=pts[-1]
               for along,st in assigned.get(sid,[]):
-                node=('s',st['id']); station_nodes[node]=st; marks.append((along,node,st))
+                n=('s',st['id']); snodes[n]=st; nodepoint[n]=st['point']; marks.append((along,n,st['point']))
               marks.sort(key=lambda x:(x[0],str(x[1])))
-              # keep all station nodes, including coincident positions, connected by zero-length links
-              chain=[]
-              for m in marks:
-                chain.append(m)
-              section_chains[sid]=chain
-              for a,b in zip(chain,chain[1:]):
-                w=max(0.,b[0]-a[0]); graph[a[1]].append((b[1],w)); graph[b[1]].append((a[1],w)); edge_count+=1
-            # Multi-source Dijkstra -> adjacency gaps where station Voronoi regions meet.
+              for a,b in zip(marks,marks[1:]):
+                w=max(0.,b[0]-a[0]); graph[a[1]].append((b[1],w)); graph[b[1]].append((a[1],w)); edges.append((a[1],b[1],w))
             dist={}; owner={}; heap=[]
-            for node,st in station_nodes.items():
-              dist[node]=0.; owner[node]=node; heapq.heappush(heap,(0.,str(node),node))
+            for n in snodes: dist[n]=0.; owner[n]=n; heapq.heappush(heap,(0.,str(n),n))
             while heap:
               d,_,x=heapq.heappop(heap)
               if d!=dist.get(x): continue
               for y,w in graph.get(x,[]):
                 nd=d+w
-                if nd < dist.get(y,float('inf'))-1e-8:
-                  dist[y]=nd; owner[y]=owner[x]; heapq.heappush(heap,(nd,str(y),y))
+                if nd<dist.get(y,float('inf'))-1e-8: dist[y]=nd; owner[y]=owner[x]; heapq.heappush(heap,(nd,str(y),y))
             gaps={}
-            for x,edges in graph.items():
-              if x not in owner: continue
-              for y,w in edges:
-                if y not in owner or owner[x]==owner[y]: continue
-                a,b=sorted([owner[x],owner[y]],key=str); key=(a,b); L=dist[x]+w+dist[y]
-                if L < gaps.get(key,float('inf')): gaps[key]=L
-            return {'stations':gst,'sec_ids':sec_ids,'graph':graph,'station_nodes':station_nodes,'section_chains':section_chains,
-                    'gaps':gaps,'edge_count':edge_count}
+            for x,y,w in edges:
+              if x not in owner or y not in owner or owner[x]==owner[y]: continue
+              a,b=sorted([owner[x],owner[y]],key=str); L=dist[x]+w+dist[y]
+              if L<gaps.get((a,b),float('inf')): gaps[(a,b)]=L
+            return snodes,gaps
 
-          built={g:build_group(g) for g in sorted(target_groups)}
-          print('GROUPS',len(built))
-          for g,bg in built.items(): print('GROUP',g,'stations',len(bg['station_nodes']),'sections',len(bg['sec_ids']),'edges',bg['edge_count'],'gaps',len(bg['gaps']))
-
-          mappings=[]
-          for p,pairs in pentries:
-            qp=(float(p['lat']),float(p['lon'])); candidates=[]
-            for g in pairs:
-              bg=built[g]
-              # nearest service section projection
-              best=None
-              for sid in bg['sec_ids']:
-                pts=curves[sections[sid]['curve']]; pr=project_point(qp,pts)
-                if best is None or pr[0]<best[0]: best=(pr[0],sid,pr)
-              off,sid,pr=best; qalong=pr[1]; chain=bg['section_chains'][sid]
-              # locate interval containing projected future station
-              idx=0
-              while idx+1<len(chain) and chain[idx+1][0] < qalong: idx+=1
-              left=chain[idx]; right=chain[min(idx+1,len(chain)-1)]
-              init=[]
-              init.append((max(0.,qalong-left[0]),left[1]))
-              init.append((max(0.,right[0]-qalong),right[1]))
-              qdist={}; heap=[]
-              for d,n in init:
-                if d<qdist.get(n,float('inf')): qdist[n]=d; heapq.heappush(heap,(d,str(n),n))
-              station_d={}
-              while heap and len(station_d)<max(8,len(bg['station_nodes'])):
-                d,_,x=heapq.heappop(heap)
-                if d!=qdist.get(x): continue
-                if x in bg['station_nodes']: station_d[x]=d
-                for y,w in bg['graph'].get(x,[]):
-                  nd=d+w
-                  if nd<qdist.get(y,float('inf'))-1e-8:
-                    qdist[y]=nd; heapq.heappush(heap,(nd,str(y),y))
-              for (a,b),L in bg['gaps'].items():
-                if a in station_d and b in station_d:
-                  residual=abs(station_d[a]+station_d[b]-L)
-                  candidates.append((residual,off,station_d[a]+station_d[b],g,a,b,L,sid))
-            candidates.sort(key=lambda x:(x[0],x[1],x[2]))
-            if not candidates: raise SystemExit(f'no candidate gap mapping for {p["future_station"]}')
-            residual,off,_,g,a,b,L,sid=candidates[0]; bg=built[g]
-            rec={'future_station':p['future_station'],'service':'/'.join(g),'left_station':bg['station_nodes'][a]['name'],
-                 'right_station':bg['station_nodes'][b]['name'],'gap_length_m':round(L,2),'path_residual_m':round(residual,3),
-                 'future_offtrack_m':round(off,2),'nearest_section':sid}
-            mappings.append(rec); print('MAP',json.dumps(rec,ensure_ascii=False))
-
-          residuals=[x['path_residual_m'] for x in mappings]; offtracks=[x['future_offtrack_m'] for x in mappings]
-          summary={'source_url':u,'zip_sha256':hashlib.sha256(rr.content).hexdigest(),'xml_sha256':hashlib.sha256(xb).hexdigest(),
-                   'actual_encoding':'cp932','label_sha256':LABEL_SHA,'positive_count':17,'target_group_count':len(target_groups),
-                   'mappings':mappings,'mapping_diag':{'residual_max_m':max(residuals),'offtrack_max_m':max(offtracks),
-                   'residual_le25':sum(x<=25 for x in residuals),'offtrack_le250':sum(x<=250 for x in offtracks)}}
-          q=Path('out/transit_future_2020_positive_gap_mapping.json'); q.write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
-          print('DIAG',json.dumps(summary['mapping_diag'],ensure_ascii=False))
+          rows=[]; group_stats=[]
+          for group,gst in sorted(bygroup.items()):
+            if len(gst)<2: continue
+            sn,gaps=build(group,gst); group_stats.append((group,len(gst),len(gaps)))
+            for (a,b),L in gaps.items():
+              A=sn[a]; B=sn[b]; n1,n2=sorted([norm(A['name']),norm(B['name'])]); key=(group[0],group[1],n1,n2)
+              ispos=key in pos_keys
+              relevant_brt=(group[0]=='東日本旅客鉄道' and group[1] in {'大船渡線','気仙沼線'} and (norm(A['name']) in brt or norm(B['name']) in brt))
+              rows.append({'operator':group[0],'line':group[1],'station_a_id':A['id'],'station_a':A['name'],'station_b_id':B['id'],'station_b':B['name'],
+                           'gap_length_m':round(L,3),'endpoint_centroid_lat':round((A['point'][0]+B['point'][0])/2,7),'endpoint_centroid_lon':round((A['point'][1]+B['point'][1])/2,7),
+                           'railway_type_a':A['type'],'railway_type_b':B['type'],'service_provider_type_a':A['provider'],'service_provider_type_b':B['provider'],
+                           'official_brt_special_mode_excluded':relevant_brt,'positive_infill_2020_2025':ispos})
+          matched={ (r['operator'],r['line'],*sorted([norm(r['station_a']),norm(r['station_b'])])) for r in rows if r['positive_infill_2020_2025'] }
+          missing=sorted(pos_keys-matched)
+          if missing: raise SystemExit('positive gaps missing from universe: '+repr(missing))
+          if len(matched)!=17: raise SystemExit(f'expected 17 matched positives, got {len(matched)}')
+          eligible=[r for r in rows if not r['official_brt_special_mode_excluded']]
+          eligible.sort(key=lambda r:(-r['gap_length_m'],r['operator'],r['line'],r['station_a'],r['station_b']))
+          P=sum(r['positive_infill_2020_2025'] for r in eligible); N=len(eligible); prevalence=P/N
+          hits=0; ap=0.; pos_ranks=[]
+          for rank,r in enumerate(eligible,1):
+            if r['positive_infill_2020_2025']:
+              hits+=1; ap+=hits/rank; pos_ranks.append(rank)
+          ap=ap/P if P else 0.
+          def top(k):
+            k=min(k,N); h=sum(r['positive_infill_2020_2025'] for r in eligible[:k]); return {'k':k,'hits':h,'precision':h/k if k else 0.,'recall':h/P if P else 0.}
+          poslens=[r['gap_length_m'] for r in eligible if r['positive_infill_2020_2025']]; neglens=[r['gap_length_m'] for r in eligible if not r['positive_infill_2020_2025']]
+          def med(x):
+            x=sorted(x); n=len(x); return x[n//2] if n%2 else (x[n//2-1]+x[n//2])/2
+          summary={'source_url':u,'zip_sha256':hashlib.sha256(rr.content).hexdigest(),'xml_sha256':hashlib.sha256(xb).hexdigest(),'actual_encoding':'cp932',
+                   'positive_mapping_sha256':MAP_SHA,'all_gap_count':len(rows),'eligible_gap_count':N,'special_mode_excluded_count':len(rows)-N,'positive_count':P,
+                   'prevalence':prevalence,'gap_length_average_precision':ap,'positive_rank_median':med(pos_ranks),'positive_gap_length_median_m':med(poslens),'negative_gap_length_median_m':med(neglens),
+                   'topk':[top(17),top(50),top(100),top(max(1,round(N*.01))),top(max(1,round(N*.05)))],
+                   'note':'diagnostic ranking only; unlabeled gaps are not yet frozen as negatives until 2025 service-survival/censoring audit'}
+          out=Path('out/transit_future_gap_universe_2020.csv')
+          fields=list(rows[0].keys())
+          with out.open('w',encoding='utf-8',newline='') as f:
+            w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(sorted(rows,key=lambda r:(r['operator'],r['line'],r['station_a_id'],r['station_b_id'])))
+          summary['gap_csv_sha256']=hashlib.sha256(out.read_bytes()).hexdigest()
+          q=Path('out/transit_future_gap_universe_2020_summary.json'); q.write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('UNIVERSE',len(rows),'eligible',N,'positive',P,'special_excluded',len(rows)-N)
+          print('BASELINE prevalence',prevalence,'AP',ap,'pos_rank_median',summary['positive_rank_median'],'pos_gap_median',summary['positive_gap_length_median_m'],'neg_gap_median',summary['negative_gap_length_median_m'])
+          print('TOPK',json.dumps(summary['topk'],ensure_ascii=False))
+          print('CSV_SHA',summary['gap_csv_sha256'])
           print('SUMMARY_SHA',hashlib.sha256(q.read_bytes()).hexdigest())
           PY
           sha256sum out/*
-      - name: Upload positive gap mapping
+      - name: Upload gap universe freeze
         uses: actions/upload-artifact@v4
         with:
-          name: transit-future-2020-positive-gap-mapping
+          name: transit-future-gap-universe-2020
           path: out/
           if-no-files-found: error
           retention-days: 1
