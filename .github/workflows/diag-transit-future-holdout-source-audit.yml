@@ -12,38 +12,64 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Discover exact e-Stat GIS API for 2010 Census 500m
+      - name: Resolve exact 2010 Census 500m e-Stat IDs without reading holdout outcomes
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet 'requests==2.32.5'
+          python3 -m pip install --quiet 'requests==2.32.5' 'beautifulsoup4==4.13.4'
           mkdir -p out
           python3 - <<'PY'
-          import hashlib,re
+          import hashlib,json,re
           from pathlib import Path
           import requests
+          from bs4 import BeautifulSoup
           s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0','Referer':'https://www.e-stat.go.jp/gis/statmap-search'})
-          urls=[
-            'https://www.e-stat.go.jp/modules/custom/gis_download/js/gis_download-main.js',
-            'https://www.e-stat.go.jp/modules/custom/gis_download/js/gis_download-main.js?XXfqyzmEN9kP',
-          ]
-          text=''
-          for i,u in enumerate(urls):
-            r=s.get(u,timeout=60); print('JS',i,r.status_code,len(r.content),r.url); Path(f'out/gis_{i}.js').write_bytes(r.content)
-            if r.status_code==200 and len(r.text)>len(text): text=r.text
-          for i,line in enumerate(text.splitlines(),1):
-            if any(k in line for k in ['search_detail','search-detail','statmap-search','gis/', 'aggregateUnit','toukeiYear','statsId','serveyId','surveyId','statisticsTable']):
-              print('LINE',i,line[:4000])
-          eps=sorted(set(re.findall(r'["\']([^"\']*(?:gis|statmap)[^"\']*)["\']',text,re.I)))
-          Path('out/endpoints.txt').write_text('\n'.join(eps),encoding='utf-8')
-          print('ENDPOINTS',len(eps))
-          for x in eps: print('EP',x[:1000])
+          u='https://www.e-stat.go.jp/gis/statmap-search/search_detail'
+          params={'type':'1','page':'1','toukeiCode':'00200521','toukeiYear':'2010','aggregateUnit':'H','facet_flg':'1','all_count_flg':'1','show_child_item':'1','show_child2_item':'1'}
+          r=s.get(u,params=params,timeout=60); r.raise_for_status()
+          print('URL',r.url,'STATUS',r.status_code,'BYTES',len(r.content),'SHA',hashlib.sha256(r.content).hexdigest())
+          Path('out/search_detail.json').write_bytes(r.content)
+          j=r.json(); print('KEYS',sorted(j.keys()))
+          targets=[]
+          for key in ['detail','facet','side_mega','filter_link']:
+            if isinstance(j.get(key),str): targets.append((key,j[key]))
+          tf=j.get('target_facet') or {}
+          if isinstance(tf,dict):
+            for key,val in tf.items():
+              if isinstance(val,str): targets.append(('target_facet.'+key,val))
+          records=[]
+          for source,html in targets:
+            soup=BeautifulSoup(html,'html.parser')
+            for tag in soup.find_all(True):
+              attrs={str(k):str(v) for k,v in tag.attrs.items() if str(k).startswith('data-')}
+              txt=' '.join(tag.stripped_strings)
+              blob=' '.join([source,txt,json.dumps(attrs,ensure_ascii=False)])
+              if any(x in blob for x in ['男女別人口総数','世帯総数','500m','500ｍ','500M','T000','H00200521']):
+                rec={'source':source,'tag':tag.name,'text':txt[:1000],'attrs':attrs}
+                records.append(rec)
+          # dedup records
+          seen=set(); clean=[]
+          for x in records:
+            k=json.dumps(x,ensure_ascii=False,sort_keys=True)
+            if k not in seen: seen.add(k); clean.append(x)
+          Path('out/candidate_records.json').write_text(json.dumps(clean,ensure_ascii=False,indent=2),encoding='utf-8')
+          alltxt=json.dumps(j,ensure_ascii=False)
+          stats=sorted(set(re.findall(r'T\d{6}',alltxt)))
+          surveys=sorted(set(re.findall(r'H00200521\d{4,}',alltxt)))
+          releases=sorted(set(re.findall(r'20\d{2}[-/]\d{1,2}[-/]\d{1,2}',alltxt)))
+          print('STATS_IDS',stats)
+          print('SURVEY_IDS',surveys)
+          print('RELEASE_DATES',releases[:80])
+          print('CANDIDATE_RECORDS',len(clean))
+          for x in clean:
+            print('REC',json.dumps(x,ensure_ascii=False)[:6000])
+          # Save only source-discovery response; no N02 future snapshots are fetched here.
           PY
           sha256sum out/*
-      - name: Upload endpoint audit
+      - name: Upload exact-ID evidence
         uses: actions/upload-artifact@v4
         with:
-          name: transit-future-estat-endpoint-audit
+          name: transit-future-2010-census-id-audit
           path: out/
           if-no-files-found: error
           retention-days: 2
