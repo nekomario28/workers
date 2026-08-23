@@ -1,4 +1,4 @@
-name: Diagnostic Transit Future S12 Research-Only Station Audit
+name: Diagnostic Transit Future Official BRT Mask
 
 on:
   pull_request:
@@ -11,15 +11,15 @@ permissions:
 jobs:
   audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
-      - name: Cross-check 2011-2015 positives against S12 operator station inventory
+      - name: Mask non-rail BRT positives using official operator inventory
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet 'requests==2.32.5' 'pyshp==2.3.1'
+          python3 -m pip install --quiet 'requests==2.32.5' 'beautifulsoup4==4.13.4'
           mkdir -p input out
           curl --fail --location --silent --show-error \
             -H "Authorization: Bearer ${GH_TOKEN}" \
@@ -29,83 +29,80 @@ jobs:
             -o /tmp/v2.zip
           unzip -q /tmp/v2.zip -d input
           python3 - <<'PY'
-          import csv, hashlib, io, json, requests, unicodedata, zipfile
-          from collections import defaultdict, Counter
+          import csv, hashlib, json, requests, unicodedata
+          from collections import Counter
           from pathlib import Path
-          import shapefile
+          from bs4 import BeautifulSoup
 
           SRC=Path('input/transit_future_positive_labels_v2.csv')
           SRC_SHA='1beb73425ab6f1f89e4e7e02d962c20e4c7fdbc150fb0592d69d560b05eb3eab'
           if hashlib.sha256(SRC.read_bytes()).hexdigest()!=SRC_SHA: raise SystemExit('v2 SHA mismatch')
           rows=list(csv.DictReader(SRC.open(encoding='utf-8')))
-          cohort=[r for r in rows if r['from_year']=='2011' and r['to_year']=='2015' and r['final_positive_v2']=='True']
-          print('COHORT_POSITIVES',len(cohort))
-
-          # S12-16 is research-only/non-commercial and is used ONLY as a source-quality audit.
-          # It is not copied into the production label or feature set.
-          urls=[
-            'https://nlftp.mlit.go.jp/ksj/gml/data/S12/S12-16/S12-16_GML.zip',
-            'https://nlftp.mlit.go.jp/ksj/gml/data/S12/S12-16/S12-16.zip',
-          ]
-          b=None; used_url=None
-          for u in urls:
-            r=requests.get(u,headers={'User-Agent':'Mozilla/5.0'},timeout=120)
-            print('FETCH_TRY',u,r.status_code,len(r.content),r.content[:4])
-            if r.status_code==200 and r.content[:2]==b'PK': b=r.content; used_url=u; break
-          if b is None: raise SystemExit('S12-16 download failed')
-          raw_sha=hashlib.sha256(b).hexdigest(); print('S12_RAW_SHA',raw_sha,used_url)
-          z=zipfile.ZipFile(io.BytesIO(b)); names=z.namelist()
-          shpfiles=sorted([n for n in names if n.lower().endswith('.shp')],key=lambda n:(0 if '/utf-8/' in n.lower() else 1,n))
-          rdr=None; used=None
-          for shp in shpfiles:
-            base=shp[:-4]; need={e:next((n for n in names if n.lower()==(base+e).lower()),None) for e in ['.shp','.shx','.dbf']}
-            if not all(need.values()): continue
-            for enc in (['utf-8','cp932'] if '/utf-8/' in shp.lower() else ['cp932','utf-8']):
-              try:
-                x=shapefile.Reader(shp=io.BytesIO(z.read(need['.shp'])),shx=io.BytesIO(z.read(need['.shx'])),dbf=io.BytesIO(z.read(need['.dbf'])),encoding=enc)
-                fields=[f[0] for f in x.fields[1:]]
-                if all(k in fields for k in ['S12_001','S12_002','S12_003','S12_004']):
-                  if len(x): _=x.record(0)
-                  rdr=x; used=(shp,enc,fields); break
-              except UnicodeDecodeError: pass
-            if rdr is not None: break
-          if rdr is None: raise SystemExit(f'S12 station shapefile not decoded: {shpfiles[:10]}')
-          print('PARSE',used[0],used[1],len(rdr),used[2])
-
           def norm(x): return ''.join(unicodedata.normalize('NFKC',str(x or '')).split())
-          byname=defaultdict(list)
-          fields=used[2]
-          for rec in rdr.iterRecords():
-            d=dict(zip(fields,rec)); name=norm(d.get('S12_001'))
-            if name: byname[name].append({'operator':norm(d.get('S12_002')),'line':norm(d.get('S12_003')),'type':str(d.get('S12_004','')).strip()})
 
-          results=[]; counts=Counter()
-          for c in cohort:
-            pairs=[]
-            for token in c['future_operator_lines'].split(';'):
-              if '/' in token:
-                op,line=token.split('/',1); pairs.append((norm(op),norm(line)))
-            hits=byname.get(norm(c['future_station']),[])
-            exact=[h for h in hits if any(h['operator']==op and h['line']==line for op,line in pairs)]
-            linehits=[h for h in hits if any(h['line']==line for op,line in pairs)]
-            status='exact_service' if exact else ('same_line' if linehits else ('name_only' if hits else 'absent'))
-            counts[status]+=1
-            results.append({'station':c['future_station'],'class':c['class'],'future_operator_lines':c['future_operator_lines'],'status':status,'matches':exact or linehits or hits})
-          print('STATUS_COUNTS',json.dumps(dict(counts),ensure_ascii=False))
-          print('NON_EXACT',json.dumps([x for x in results if x['status']!='exact_service'],ensure_ascii=False))
-          summary={'purpose':'research-only source-quality audit; S12 must not enter commercial label/features',
-                   'input_v2_sha256':SRC_SHA,'cohort':'2011->2015','cohort_positive_count':len(cohort),
-                   's12_url':used_url,'s12_sha256':raw_sha,'parse_source':used[0],'encoding':used[1],
-                   'status_counts':dict(counts),'results':results}
-          p=Path('out/s12_2015_station_inventory_audit.json')
-          p.write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
-          print('SUMMARY_SHA',hashlib.sha256(p.read_bytes()).hexdigest())
+          # Independent official operator inventory. This page explicitly separates BRT ridership
+          # from ordinary rail ridership and lists the 2015 BRT stations by route.
+          url='https://www.jreast.co.jp/passenger/2015_brt.html'
+          r=requests.get(url,headers={'User-Agent':'Mozilla/5.0'},timeout=60); r.raise_for_status()
+          raw_sha=hashlib.sha256(r.content).hexdigest()
+          soup=BeautifulSoup(r.content,'html.parser',from_encoding=r.apparent_encoding)
+          text='\n'.join(soup.stripped_strings)
+          if '気仙沼線BRT' not in text or '大船渡線BRT' not in text:
+            raise SystemExit('official BRT page structure not recognized')
+
+          brt_names=set()
+          # Tables are route-specific; accepting a station name only when it appears in the official
+          # BRT page is conservative. Non-station headings/numbers cannot match our candidate names.
+          for tr in soup.find_all('tr'):
+            cells=[' '.join(td.stripped_strings) for td in tr.find_all(['th','td'])]
+            if cells:
+              name=norm(cells[0])
+              if name and name not in {'駅名','気仙沼線BRT','大船渡線BRT'}:
+                brt_names.add(name)
+          # HTML variants may not use table markup; seed only route rows verified by visible text.
+          for c in rows:
+            n=norm(c['future_station'])
+            if n and n in norm(text):
+              # Restrict text fallback to JR East's two official BRT route identities.
+              if ('東日本旅客鉄道/大船渡線' in c['future_operator_lines'] or
+                  '東日本旅客鉄道/気仙沼線' in c['future_operator_lines']):
+                brt_names.add(n)
+
+          out=[]; masked=[]; counts=Counter()
+          for c in rows:
+            prev=(c['final_positive_v2']=='True')
+            is_brt=(norm(c['future_station']) in brt_names and
+                    ('東日本旅客鉄道/大船渡線' in c['future_operator_lines'] or
+                     '東日本旅客鉄道/気仙沼線' in c['future_operator_lines']))
+            final=prev and not is_brt
+            if prev and is_brt:
+              masked.append({'station':c['future_station'],'class':c['class'],'from_year':c['from_year'],'to_year':c['to_year'],'future_operator_lines':c['future_operator_lines']})
+            if final: counts[c['class']]+=1
+            out.append({**c,'official_brt_mask':is_brt,'final_positive_v3':final,
+                        'final_positive_reason_v3':'official_brt_excluded' if prev and is_brt else c['final_positive_reason_v2']})
+
+          fields=list(rows[0].keys())+['official_brt_mask','final_positive_v3','final_positive_reason_v3']
+          p=Path('out/transit_future_positive_labels_v3.csv')
+          with p.open('w',encoding='utf-8',newline='') as f:
+            w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(out)
+          summary={'input_v2_sha256':SRC_SHA,'official_brt_url':url,'official_brt_page_sha256':raw_sha,
+                   'masked_positive_count':len(masked),'masked_positives':masked,
+                   'final_positive_by_class':dict(counts),'final_positive_total':sum(counts.values()),
+                   'csv_sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
+          q=Path('out/transit_future_positive_labels_v3_summary.json')
+          q.write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('BRT_PAGE_SHA',raw_sha)
+          print('MASKED',json.dumps(masked,ensure_ascii=False))
+          print('FINAL_POSITIVE_BY_CLASS',json.dumps(dict(counts),ensure_ascii=False))
+          print('FINAL_POSITIVE_TOTAL',sum(counts.values()))
+          print('CSV_SHA',summary['csv_sha256'])
+          if not masked: raise SystemExit('expected official BRT contamination but found none')
           PY
           sha256sum out/*
-      - name: Upload S12 audit metadata only
+      - name: Upload BRT-masked label freeze
         uses: actions/upload-artifact@v4
         with:
-          name: transit-future-s12-audit-2015
+          name: transit-future-positive-labels-v3
           path: out/
           if-no-files-found: error
           retention-days: 1
