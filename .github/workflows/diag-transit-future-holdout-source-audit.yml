@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Resolve exact 2010 Census 500m e-Stat IDs without reading holdout outcomes
+      - name: Resolve exact statsId for 2010 Census 500m population table
         shell: bash
         run: |
           set -euo pipefail
@@ -25,51 +25,39 @@ jobs:
           from bs4 import BeautifulSoup
           s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0','Referer':'https://www.e-stat.go.jp/gis/statmap-search'})
           u='https://www.e-stat.go.jp/gis/statmap-search/search_detail'
-          params={'type':'1','page':'1','toukeiCode':'00200521','toukeiYear':'2010','aggregateUnit':'H','facet_flg':'1','all_count_flg':'1','show_child_item':'1','show_child2_item':'1'}
-          r=s.get(u,params=params,timeout=60); r.raise_for_status()
-          print('URL',r.url,'STATUS',r.status_code,'BYTES',len(r.content),'SHA',hashlib.sha256(r.content).hexdigest())
-          Path('out/search_detail.json').write_bytes(r.content)
-          j=r.json(); print('KEYS',sorted(j.keys()))
-          targets=[]
-          for key in ['detail','facet','side_mega','filter_link']:
-            if isinstance(j.get(key),str): targets.append((key,j[key]))
-          tf=j.get('target_facet') or {}
-          if isinstance(tf,dict):
-            for key,val in tf.items():
-              if isinstance(val,str): targets.append(('target_facet.'+key,val))
-          records=[]
-          for source,html in targets:
-            soup=BeautifulSoup(html,'html.parser')
-            for tag in soup.find_all(True):
-              attrs={str(k):str(v) for k,v in tag.attrs.items() if str(k).startswith('data-')}
-              txt=' '.join(tag.stripped_strings)
-              blob=' '.join([source,txt,json.dumps(attrs,ensure_ascii=False)])
-              if any(x in blob for x in ['男女別人口総数','世帯総数','500m','500ｍ','500M','T000','H00200521']):
-                rec={'source':source,'tag':tag.name,'text':txt[:1000],'attrs':attrs}
-                records.append(rec)
-          # dedup records
-          seen=set(); clean=[]
-          for x in records:
-            k=json.dumps(x,ensure_ascii=False,sort_keys=True)
-            if k not in seen: seen.add(k); clean.append(x)
-          Path('out/candidate_records.json').write_text(json.dumps(clean,ensure_ascii=False,indent=2),encoding='utf-8')
-          alltxt=json.dumps(j,ensure_ascii=False)
-          stats=sorted(set(re.findall(r'T\d{6}',alltxt)))
-          surveys=sorted(set(re.findall(r'H00200521\d{4,}',alltxt)))
-          releases=sorted(set(re.findall(r'20\d{2}[-/]\d{1,2}[-/]\d{1,2}',alltxt)))
-          print('STATS_IDS',stats)
-          print('SURVEY_IDS',surveys)
-          print('RELEASE_DATES',releases[:80])
-          print('CANDIDATE_RECORDS',len(clean))
-          for x in clean:
-            print('REC',json.dumps(x,ensure_ascii=False)[:6000])
-          # Save only source-discovery response; no N02 future snapshots are fetched here.
+          cases=[
+            {'type':'1','page':'1','toukeiCode':'00200521','toukeiYear':'2010','aggregateUnit':'H','serveyId':'H002005112010','all_count_flg':'1','show_child_item':'1','show_child2_item':'1'},
+            {'type':'1','page':'1','toukeiCode':'00200521','toukeiYear':'2010','aggregateUnit':'H','serveyId':'H002005112010','facet_flg':'1','all_count_flg':'1','show_child_item':'1','show_child2_item':'1'},
+          ]
+          out=[]
+          for ci,params in enumerate(cases):
+            r=s.get(u,params=params,timeout=60); r.raise_for_status(); Path(f'out/case{ci}.json').write_bytes(r.content)
+            j=r.json(); alltxt=json.dumps(j,ensure_ascii=False)
+            stats=sorted(set(re.findall(r'T\d{6}',alltxt))); print('CASE',ci,'URL',r.url,'SHA',hashlib.sha256(r.content).hexdigest(),'STATS',stats)
+            targets=[]
+            for key in ['detail','detail_sub','detail_sub2','detail_sub3','facet','side_mega','filter_link']:
+              if isinstance(j.get(key),str): targets.append((key,j[key]))
+            tf=j.get('target_facet') or {}
+            if isinstance(tf,dict):
+              for key,val in tf.items():
+                if isinstance(val,str): targets.append(('target_facet.'+key,val))
+            for source,html in targets:
+              soup=BeautifulSoup(html,'html.parser')
+              for tag in soup.find_all(True):
+                attrs={str(k):str(v) for k,v in tag.attrs.items() if str(k).startswith('data-') or str(k) in ('href','value','name')}
+                txt=' '.join(tag.stripped_strings)
+                blob=txt+' '+json.dumps(attrs,ensure_ascii=False)
+                if any(x in blob for x in ['男女別人口総数','世帯総数','T000','H002005112010']):
+                  rec={'case':ci,'source':source,'tag':tag.name,'text':txt[:1200],'attrs':attrs}
+                  out.append(rec); print('REC',json.dumps(rec,ensure_ascii=False)[:6000])
+          Path('out/records.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          # No future N02 snapshots are fetched in this source audit.
           PY
           sha256sum out/*
-      - name: Upload exact-ID evidence
+      - name: Upload statsId audit
         uses: actions/upload-artifact@v4
         with:
-          name: transit-future-2010-census-id-audit
+          name: transit-future-2010-census-statsid-audit
           path: out/
           if-no-files-found: error
           retention-days: 2
