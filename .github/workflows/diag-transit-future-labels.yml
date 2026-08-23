@@ -1,4 +1,4 @@
-name: Diagnostic Transit Future Census Mesh JS Audit
+name: Diagnostic Transit Future Census Mesh Transport
 
 on:
   pull_request:
@@ -8,45 +8,72 @@ permissions:
   contents: read
 
 jobs:
-  probe:
+  resolve:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Inspect official e-Stat GIS download JavaScript
+      - name: Resolve official e-Stat 2015 500m mesh download rows
         shell: bash
         run: |
           set -euo pipefail
+          python3 -m pip install --quiet 'requests==2.32.5' 'beautifulsoup4==4.13.4'
           mkdir -p out
           python3 - <<'PY'
-          import re, requests
+          import json,re,requests
           from pathlib import Path
-          base='https://www.e-stat.go.jp'
-          urls=[
-            base+'/modules/custom/gis_download/js/gis_download-main.js',
-            base+'/modules/custom/gis_download/js/gis_download.js',
-          ]
-          s=requests.Session(); s.headers['User-Agent']='Mozilla/5.0'
-          for i,u in enumerate(urls):
-            r=s.get(u,timeout=60); print('JS',i,r.status_code,len(r.content),r.url)
-            if r.status_code==200: Path(f'out/js{i}.js').write_bytes(r.content)
-          text='\n'.join(p.read_text(encoding='utf-8',errors='replace') for p in Path('out').glob('*.js'))
-          pats=[]
-          for pat in [r'url\s*:\s*["\']([^"\']+)',r'ajax\s*\([^)]*',r'fetch\s*\([^)]*',r'/(?:gis|modules)/[^"\'\s)]+',r'[^"\']*(?:download|mesh|statmap)[^"\']*']:
-            try:pats.extend(re.findall(pat,text,re.I))
-            except Exception as e:print('REGEX_ERR',pat,e)
-          # Also print lines with AJAX/data-loading keywords.
-          lines=[]
-          for n,line in enumerate(text.splitlines(),1):
-            if any(k in line.lower() for k in ['ajax','download','mesh','statsid','serveyid','statmap-search','drupalsettings']): lines.append(f'{n}: {line}')
-          Path('out/relevant_lines.txt').write_text('\n'.join(lines),encoding='utf-8')
-          print('RELEVANT_LINES',len(lines))
-          for x in lines[:500]: print(x[:4000])
+          from bs4 import BeautifulSoup
+          from urllib.parse import urljoin
+          BASE='https://www.e-stat.go.jp'
+          END=BASE+'/gis/statmap-search/search_detail'
+          base_params={
+            'type':'1','toukeiCode':'00200521','toukeiYear':'2015','aggregateUnit':'H',
+            'serveyId':'H002005112015','statsId':'T000847','mesh_data_flg':'1',
+            'download_disp_flg':'1','page':'1'
+          }
+          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0','Accept':'application/json, text/javascript, */*; q=0.01','X-Requested-With':'XMLHttpRequest','Referer':BASE+'/gis/statmap-search?type=1'})
+          rows=[]
+          for label,extra in [('national',{}),('tokyo',{'prefCode':'13'}),('fukuoka',{'prefCode':'40'}),('osaka',{'prefCode':'27'})]:
+            p={**base_params,**extra}
+            r=s.get(END,params=p,timeout=60); print('REQ',label,r.status_code,len(r.content),r.url); r.raise_for_status()
+            Path(f'out/{label}.json').write_bytes(r.content)
+            try:j=r.json()
+            except Exception as e: raise SystemExit(f'JSON decode failed {label}: {e}')
+            print('KEYS',label,sorted(j.keys()))
+            for k,v in j.items():
+              if isinstance(v,str): print('FIELD',label,k,'len',len(v),'sample',v[:1200].replace('\n',' '))
+              elif isinstance(v,dict): print('DICT',label,k,'keys',list(v)[:80])
+              elif isinstance(v,list): print('LIST',label,k,'n',len(v))
+            blobs=[]
+            def walk(x,path=''):
+              if isinstance(x,dict):
+                for k,v in x.items(): walk(v,path+'/'+str(k))
+              elif isinstance(x,list):
+                for i,v in enumerate(x): walk(v,path+f'/{i}')
+              elif isinstance(x,str):
+                low=x.lower()
+                if any(q in low for q in ['download','zip','csv','t000847','500m','mesh']): blobs.append((path,x))
+            walk(j)
+            print('BLOBS',label,len(blobs))
+            for path,x in blobs[:300]: print('BLOB',label,path,x[:5000].replace('\n',' '))
+            # Parse every HTML-like string for href/data attributes and preserve rows with download controls.
+            for path,x in blobs:
+              if '<' not in x: continue
+              soup=BeautifulSoup(x,'html.parser')
+              for tag in soup.find_all(True):
+                attrs={k:(' '.join(v) if isinstance(v,list) else str(v)) for k,v in tag.attrs.items()}
+                txt=' '.join(tag.stripped_strings)
+                joined=' '.join([tag.name,txt,*attrs.keys(),*attrs.values()])
+                if any(q in joined.lower() for q in ['download','zip','csv','t000847','mesh']):
+                  rows.append({'scope':label,'json_path':path,'tag':tag.name,'text':txt[:1000],'attrs':json.dumps(attrs,ensure_ascii=False)})
+          Path('out/parsed_rows.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('PARSED_ROWS',len(rows))
+          for x in rows[:500]: print('ROW',json.dumps(x,ensure_ascii=False)[:7000])
           PY
           sha256sum out/*
-      - name: Upload JS audit
+      - name: Upload transport evidence
         uses: actions/upload-artifact@v4
         with:
-          name: transit-future-census-mesh-js-audit
+          name: transit-future-census-mesh-transport
           path: out/
           if-no-files-found: error
           retention-days: 2
