@@ -1,4 +1,4 @@
-name: Diagnostic Transit Future Census Mesh Probe
+name: Diagnostic Transit Future Census Mesh JS Audit
 
 on:
   pull_request:
@@ -6,66 +6,47 @@ on:
 
 permissions:
   contents: read
-  actions: read
 
 jobs:
   probe:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Discover official e-Stat 2015 500m mesh download transport
+      - name: Inspect official e-Stat GIS download JavaScript
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet 'requests==2.32.5' 'beautifulsoup4==4.13.4'
-          mkdir -p out input
-          curl --fail --location --silent --show-error \
-            -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' \
-            'https://api.github.com/repos/nekomario28/workers/actions/artifacts/9488732799/zip' -o /tmp/labels.zip
-          unzip -q /tmp/labels.zip -d input
+          mkdir -p out
           python3 - <<'PY'
-          import csv, json, re, requests
+          import re, requests
           from pathlib import Path
-          from bs4 import BeautifulSoup
-          from urllib.parse import urljoin
-          labels=list(csv.DictReader(open('input/transit_future_gap_labels_2020_2025_v1.csv',encoding='utf-8')))
-          print('LABELS',len(labels),'POS',sum(r['label_status_v1']=='positive' for r in labels))
+          base='https://www.e-stat.go.jp'
           urls=[
-            'https://www.e-stat.go.jp/gis/statmap-search?page=1&type=1&toukeiCode=00200521&toukeiYear=2015&aggregateUnit=H&serveyId=H002005112015&statsId=T000847',
-            'https://www.e-stat.go.jp/gis/statmap-search?page=1&type=1&toukeiCode=00200521&toukeiYear=2015&aggregateUnit=H&serveyId=H002005112015&statsId=T000847&prefCode=27',
+            base+'/modules/custom/gis_download/js/gis_download-main.js',
+            base+'/modules/custom/gis_download/js/gis_download.js',
           ]
-          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0','Accept-Language':'ja,en;q=0.8'})
-          all_links=[]
+          s=requests.Session(); s.headers['User-Agent']='Mozilla/5.0'
           for i,u in enumerate(urls):
-            r=s.get(u,timeout=60); print('PAGE',i,r.status_code,len(r.content),r.url); r.raise_for_status(); Path(f'out/page{i}.html').write_bytes(r.content)
-            soup=BeautifulSoup(r.text,'html.parser')
-            for a in soup.find_all('a',href=True):
-              h=urljoin(r.url,a['href']); t=' '.join(a.stripped_strings)
-              if any(k in h.lower() for k in ['download','statmap','mesh','stats']) or any(k in t for k in ['ダウンロード','500m','人口']): all_links.append((i,t,h))
-            for tag in soup.find_all(True):
-              for k,v in tag.attrs.items():
-                vv=' '.join(v) if isinstance(v,list) else str(v)
-                if any(x in vv.lower() for x in ['download','t000847','h002005112015']): all_links.append((i,f'ATTR {tag.name} {k}',vv))
-          seen=set(); uniq=[]
-          for x in all_links:
-            if x not in seen:seen.add(x);uniq.append(x)
-          Path('out/links.tsv').write_text('\n'.join('\t'.join(map(str,x)) for x in uniq),encoding='utf-8')
-          print('LINKS',len(uniq))
-          for x in uniq[:300]:print('LINK',x)
-          # extract likely endpoint strings from raw HTML/scripts
-          text='\n'.join(Path(f'out/page{i}.html').read_text(encoding='utf-8',errors='replace') for i in range(len(urls)))
-          pats=sorted(set(re.findall(r'''["']([^"']*(?:download|statmap|statsData|mesh)[^"']*)["']''',text,re.I)))
-          Path('out/candidate_strings.txt').write_text('\n'.join(pats),encoding='utf-8')
-          print('CANDIDATE_STRINGS',len(pats))
-          for p in pats[:300]:print('STR',p[:1000])
+            r=s.get(u,timeout=60); print('JS',i,r.status_code,len(r.content),r.url)
+            if r.status_code==200: Path(f'out/js{i}.js').write_bytes(r.content)
+          text='\n'.join(p.read_text(encoding='utf-8',errors='replace') for p in Path('out').glob('*.js'))
+          pats=[]
+          for pat in [r'url\s*:\s*["\']([^"\']+)',r'ajax\s*\([^)]*',r'fetch\s*\([^)]*',r'/(?:gis|modules)/[^"\'\s)]+',r'[^"\']*(?:download|mesh|statmap)[^"\']*']:
+            try:pats.extend(re.findall(pat,text,re.I))
+            except Exception as e:print('REGEX_ERR',pat,e)
+          # Also print lines with AJAX/data-loading keywords.
+          lines=[]
+          for n,line in enumerate(text.splitlines(),1):
+            if any(k in line.lower() for k in ['ajax','download','mesh','statsid','serveyid','statmap-search','drupalsettings']): lines.append(f'{n}: {line}')
+          Path('out/relevant_lines.txt').write_text('\n'.join(lines),encoding='utf-8')
+          print('RELEVANT_LINES',len(lines))
+          for x in lines[:500]: print(x[:4000])
           PY
           sha256sum out/*
-      - name: Upload census mesh transport evidence
+      - name: Upload JS audit
         uses: actions/upload-artifact@v4
         with:
-          name: transit-future-census-mesh-probe
+          name: transit-future-census-mesh-js-audit
           path: out/
           if-no-files-found: error
           retention-days: 2
