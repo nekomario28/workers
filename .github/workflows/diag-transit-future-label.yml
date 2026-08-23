@@ -1,4 +1,4 @@
-name: Diagnostic Transit Future N02 GML Relation Audit CP932
+name: Diagnostic Transit Future N02 Graph Feasibility
 
 on:
   pull_request:
@@ -6,57 +6,138 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
-      - name: Parse N02-20 GML relations after verified CP932 decode
+      - name: Audit 2020 rail graph and station-section snapping
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          mkdir -p input out
+          curl --fail --location --silent --show-error \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            'https://api.github.com/repos/nekomario28/workers/actions/artifacts/9488593216/zip' \
+            -o /tmp/v3.zip
+          unzip -q /tmp/v3.zip -d input
           python3 - <<'PY'
-          import hashlib, io, json, requests, zipfile, xml.etree.ElementTree as ET
+          import csv, hashlib, io, json, math, requests, statistics, unicodedata, zipfile, xml.etree.ElementTree as ET
+          from collections import Counter, defaultdict
           from pathlib import Path
+
+          LABEL=Path('input/transit_future_positive_labels_v3.csv')
+          LABEL_SHA='337715abd92a13338c5544d5b5a863cf7e61e74ea14e66a6eb58687ae432106e'
+          if hashlib.sha256(LABEL.read_bytes()).hexdigest()!=LABEL_SHA: raise SystemExit('v3 label SHA mismatch')
+          positives=[r for r in csv.DictReader(LABEL.open(encoding='utf-8'))
+                     if r['from_year']=='2020' and r['to_year']=='2025' and r['class']=='existing_line_infill_candidate' and r['final_positive_v3']=='True']
+          if len(positives)!=17: raise SystemExit(f'expected 17 clean 2020->2025 infill positives, got {len(positives)}')
+
           u='https://nlftp.mlit.go.jp/ksj/gml/data/N02/N02-20/N02-20_GML.zip'
           r=requests.get(u,headers={'User-Agent':'Mozilla/5.0'},timeout=120); r.raise_for_status()
-          z=zipfile.ZipFile(io.BytesIO(r.content)); target='N02-20_GML/N02-20.xml'; b=z.read(target)
-          # Prior exact-head diagnostic proved the file falsely declares UTF-8 while bytes are CP932.
-          s=b.decode('cp932')
-          sample={'RailroadSection':None,'Station':None}; counts={'RailroadSection':0,'Station':0}; child_tags={}
-          hrefs={'RailroadSection':[],'Station':[]}; attrs={}
-          XLINK='{http://www.w3.org/1999/xlink}href'
+          z=zipfile.ZipFile(io.BytesIO(r.content)); b=z.read('N02-20_GML/N02-20.xml'); s=b.decode('cp932')
+          GML='{http://www.opengis.net/gml/3.2}'; XLINK='{http://www.w3.org/1999/xlink}href'
+          def loc(t): return t.split('}')[-1]
+          def norm(x): return ''.join(unicodedata.normalize('NFKC',str(x or '')).split())
+          def hav(a,b):
+            lat1,lon1=a; lat2,lon2=b; R=6371000.0
+            p1=math.radians(lat1); p2=math.radians(lat2); dp=math.radians(lat2-lat1); dl=math.radians(lon2-lon1)
+            q=math.sin(dp/2)**2+math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+            return 2*R*math.asin(min(1,math.sqrt(q)))
+          def child_text(el,name):
+            for c in el:
+              if loc(c.tag)==name: return (c.text or '').strip()
+            return ''
+          def child_href(el,name):
+            for c in el:
+              if loc(c.tag)==name: return c.attrib.get(XLINK,'').lstrip('#')
+            return ''
+
+          curves={}; sections={}; stations=[]
           for ev,el in ET.iterparse(io.StringIO(s),events=('end',)):
-            local=el.tag.split('}')[-1]
-            if local in sample:
-              counts[local]+=1
-              if sample[local] is None:
-                sample[local]=ET.tostring(el,encoding='unicode')[:16000]
-                child_tags[local]=[c.tag.split('}')[-1] for c in list(el)]
-                attrs[local]=dict(el.attrib)
-                for d in el.iter():
-                  if XLINK in d.attrib:
-                    hrefs[local].append({'tag':d.tag.split('}')[-1],'href':d.attrib[XLINK]})
+            name=loc(el.tag)
+            if name=='Curve':
+              gid=el.attrib.get(GML+'id',''); pos=None
+              for d in el.iter():
+                if loc(d.tag)=='posList' and d.text: pos=d.text; break
+              if gid and pos:
+                vals=[float(x) for x in pos.split()]
+                curves[gid]=[(vals[i],vals[i+1]) for i in range(0,len(vals)-1,2)]
               el.clear()
-          print('COUNTS',counts)
-          print('CHILD_TAGS',json.dumps(child_tags,ensure_ascii=False))
-          print('HREFS',json.dumps(hrefs,ensure_ascii=False))
-          print('ATTRS',json.dumps(attrs,ensure_ascii=False))
-          print('RAILROAD_SAMPLE',sample['RailroadSection'])
-          print('STATION_SAMPLE',sample['Station'])
-          if counts['RailroadSection']==0 or counts['Station']==0: raise SystemExit('expected feature types absent')
+            elif name=='RailroadSection':
+              sid=el.attrib.get(GML+'id','')
+              sections[sid]={'curve':child_href(el,'location'),'type':child_text(el,'railwayType'),
+                             'line':norm(child_text(el,'railwayLineName')),'op':norm(child_text(el,'operationCompany'))}
+              el.clear()
+            elif name=='Station':
+              stations.append({'id':el.attrib.get(GML+'id',''),'curve':child_href(el,'location'),
+                               'section':child_href(el,'railroadSection'),'type':child_text(el,'railwayType'),
+                               'line':norm(child_text(el,'railwayLineName')),'op':norm(child_text(el,'operationCompany')),
+                               'name':child_text(el,'stationName')})
+              el.clear()
+
+          missing_section=0; missing_curve=0; group_mismatch=0; per_section=Counter(); snaps=[]; snap_rows=[]
+          endpoint_degree=Counter(); endpoint_sections=defaultdict(list)
+          for sid,sec in sections.items():
+            pts=curves.get(sec['curve'])
+            if not pts: continue
+            for p in (pts[0],pts[-1]): endpoint_sections[(sec['op'],sec['line'],round(p[0],8),round(p[1],8))].append(sid)
+          for k,v in endpoint_sections.items(): endpoint_degree[len(v)]+=1
+          for st in stations:
+            sec=sections.get(st['section'])
+            if not sec: missing_section+=1; continue
+            per_section[st['section']]+=1
+            if sec['op']!=st['op'] or sec['line']!=st['line']: group_mismatch+=1
+            sp=curves.get(st['curve']); rp=curves.get(sec['curve'])
+            if not sp or not rp: missing_curve+=1; continue
+            lat=(min(p[0] for p in sp)+max(p[0] for p in sp))/2; lon=(min(p[1] for p in sp)+max(p[1] for p in sp))/2
+            ds=[hav((lat,lon),p) for p in rp]; d=min(ds); snaps.append(d)
+            snap_rows.append((st['name'],st['op'],st['line'],st['section'],d))
+
+          snaps_sorted=sorted(snaps)
+          def pct(p): return snaps_sorted[min(len(snaps_sorted)-1,max(0,round((len(snaps_sorted)-1)*p)))] if snaps_sorted else None
+          multi=Counter(per_section.values())
+          print('COUNTS curves',len(curves),'sections',len(sections),'stations',len(stations))
+          print('RELATION missing_section',missing_section,'missing_curve',missing_curve,'group_mismatch',group_mismatch)
+          print('STATIONS_PER_SECTION',json.dumps(dict(sorted(multi.items())),ensure_ascii=False))
+          print('SNAP_M p50',pct(.5),'p95',pct(.95),'p99',pct(.99),'max',max(snaps) if snaps else None,'<=25',sum(d<=25 for d in snaps),'<=50',sum(d<=50 for d in snaps))
+          print('ENDPOINT_MULTIPLICITY',json.dumps(dict(sorted(endpoint_degree.items())),ensure_ascii=False))
+
+          # Coverage diagnostic for the 17 future positives: service identity must exist in 2020.
+          groups={(st['op'],st['line']) for st in stations}
+          posdiag=[]
+          for p in positives:
+            pairs=[]
+            for token in p['future_operator_lines'].split(';'):
+              if '/' in token:
+                op,line=token.split('/',1); pairs.append((norm(op),norm(line)))
+            matched=[q for q in pairs if q in groups]
+            posdiag.append({'station':p['future_station'],'future_operator_lines':p['future_operator_lines'],'matched_2020_groups':['/'.join(x) for x in matched]})
+          print('POSITIVE_SERVICE_COVERAGE',sum(bool(x['matched_2020_groups']) for x in posdiag),'/',len(posdiag))
+          print('POSITIVE_DIAG',json.dumps(posdiag,ensure_ascii=False))
+
           out={'source_url':u,'zip_sha256':hashlib.sha256(r.content).hexdigest(),'xml_sha256':hashlib.sha256(b).hexdigest(),
-               'verified_actual_encoding':'cp932','declared_encoding':'UTF-8 (incorrect in source)',
-               'counts':counts,'child_tags':child_tags,'xlink_hrefs':hrefs,'attrs':attrs,
-               'railroad_sample':sample['RailroadSection'],'station_sample':sample['Station']}
-          p=Path('relation_audit_cp932.json'); p.write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
-          print('SUMMARY_SHA',hashlib.sha256(p.read_bytes()).hexdigest())
+               'actual_encoding':'cp932','label_sha256':LABEL_SHA,'clean_2020_2025_infill_count':len(positives),
+               'counts':{'curves':len(curves),'sections':len(sections),'stations':len(stations)},
+               'relation':{'missing_section':missing_section,'missing_curve':missing_curve,'group_mismatch':group_mismatch},
+               'stations_per_section':dict(sorted(multi.items())),'snap_m':{'p50':pct(.5),'p95':pct(.95),'p99':pct(.99),'max':max(snaps) if snaps else None,'le25':sum(d<=25 for d in snaps),'le50':sum(d<=50 for d in snaps)},
+               'endpoint_multiplicity':dict(sorted(endpoint_degree.items())),'positive_service_diag':posdiag}
+          q=Path('out/n02_graph_feasibility_2020.json'); q.write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('SUMMARY_SHA',hashlib.sha256(q.read_bytes()).hexdigest())
+          if missing_section or missing_curve or group_mismatch: raise SystemExit('relation integrity failure')
+          if sum(bool(x['matched_2020_groups']) for x in posdiag)!=17: raise SystemExit('future positive service absent at cutoff')
           PY
-      - name: Upload repaired relation audit
+          sha256sum out/*
+      - name: Upload graph feasibility audit
         uses: actions/upload-artifact@v4
         with:
-          name: transit-future-n02-gml-relation-audit-cp932
-          path: relation_audit_cp932.json
+          name: transit-future-n02-graph-feasibility-2020
+          path: out/
           if-no-files-found: error
           retention-days: 1
