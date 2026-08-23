@@ -39,8 +39,34 @@ jobs:
       - name: Install pinned evaluation readers
         run: python -m pip install --disable-pip-version-check xlrd==2.0.2 numpy==2.3.2
 
+      - name: Apply established Building Starts row identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          src = Path('scripts/age_growth_temporal_eval.py').read_text(encoding='utf-8')
+          old = """        code = None
+                  for c in range(min(8, sh.ncols)):
+                      x = code_from_cell(sh.cell_value(i, c))
+                      if x in TARGETS:
+                          code = x
+                          break
+                  if code is None:
+                      continue
+          """
+          new = """        label = sh.cell_value(i, 1) if sh.ncols > 1 else ''
+                  code = code_from_cell(label)
+                  if code not in TARGETS:
+                      continue
+          """
+          if src.count(old) != 1:
+              raise SystemExit(f'expected exactly one parser block, found {src.count(old)}')
+          Path('/tmp/age_growth_temporal_eval.py').write_text(src.replace(old, new), encoding='utf-8')
+          PY
+
       - name: Parse and evaluate preregistered temporal revalidation once
-        run: python scripts/age_growth_temporal_eval.py
+        run: python /tmp/age_growth_temporal_eval.py
 
       - name: Upload temporal revalidation evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
