@@ -10,91 +10,40 @@ permissions:
 jobs:
   audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
-      - name: Audit N02-2014 metadata and discover 2010 Census 500m dataset
+      - name: Discover exact e-Stat GIS API for 2010 Census 500m
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet 'requests==2.32.5' 'beautifulsoup4==4.13.4'
+          python3 -m pip install --quiet 'requests==2.32.5'
           mkdir -p out
           python3 - <<'PY'
-          import hashlib, io, json, re, zipfile
+          import hashlib,re
           from pathlib import Path
-          from urllib.parse import urljoin
           import requests
-          from bs4 import BeautifulSoup
-          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0'})
-
-          # N02-2014: inspect exact bytes, HTTP metadata and packaged metadata before choosing a cutoff.
-          nu='https://nlftp.mlit.go.jp/ksj/gml/data/N02/N02-14/N02-14_GML.zip'
-          r=s.get(nu,timeout=120); r.raise_for_status()
-          if r.content[:2]!=b'PK': raise SystemExit('N02-14 not zip')
-          Path('out/N02-14_GML.zip').write_bytes(r.content)
-          print('N02_URL',nu)
-          print('N02_SHA',hashlib.sha256(r.content).hexdigest())
-          print('N02_BYTES',len(r.content))
-          for k in ['Last-Modified','ETag','Date']: print('N02_HEADER',k,r.headers.get(k))
-          z=zipfile.ZipFile(io.BytesIO(r.content))
-          print('N02_FILES',len(z.namelist()))
-          metadata=[]
-          datepat=re.compile(r'(?:19|20)\d{2}[-/.年]\s*\d{1,2}(?:[-/.月]\s*\d{1,2}日?)?')
-          for n in z.namelist():
-            low=n.lower()
-            if any(x in low for x in ['meta','readme','ks-metadata','xml']) and not low.endswith(('.shp','.shx','.dbf')):
-              try:
-                b=z.read(n)
-                text=None
-                for enc in ['utf-8','cp932','shift_jis']:
-                  try: text=b.decode(enc); break
-                  except Exception: pass
-                if text is None: continue
-                hits=sorted(set(datepat.findall(text)))
-                if hits or '作成' in text or '更新' in text or 'publication' in text.lower() or 'date' in text.lower():
-                  metadata.append({'name':n,'sha256':hashlib.sha256(b).hexdigest(),'date_hits':hits[:30],'preview':text[:12000]})
-              except Exception: pass
-          Path('out/n02_metadata_scan.json').write_text(json.dumps(metadata,ensure_ascii=False,indent=2),encoding='utf-8')
-          print('N02_METADATA_FILES',len(metadata))
-          for m in metadata:
-            print('N02_META',m['name'],'DATES',m['date_hits'])
-
-          # e-Stat GIS: discover exact 2010 500m population table IDs from the official filtering page.
+          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0','Referer':'https://www.e-stat.go.jp/gis/statmap-search'})
           urls=[
-            'https://www.e-stat.go.jp/gis/statmap-search?aggregateUnit=H&page=1&toukeiCode=00200521&toukeiYear=2010&type=1',
-            'https://www.e-stat.go.jp/gis/statmap-search?page=1&toukeiCode=00200521&toukeiYear=2010&type=1',
+            'https://www.e-stat.go.jp/modules/custom/gis_download/js/gis_download-main.js',
+            'https://www.e-stat.go.jp/modules/custom/gis_download/js/gis_download-main.js?XXfqyzmEN9kP',
           ]
-          discoveries=[]
+          text=''
           for i,u in enumerate(urls):
-            rr=s.get(u,timeout=60); print('ESTAT_PAGE',i,rr.status_code,len(rr.content),rr.url); Path(f'out/estat_{i}.html').write_bytes(rr.content)
-            if rr.status_code!=200: continue
-            soup=BeautifulSoup(rr.text,'html.parser')
-            page_text=' '.join(soup.stripped_strings)
-            print('ESTAT_HAS_2010',i,'2010' in page_text,'ESTAT_HAS_500M',('500m' in page_text or '500ｍ' in page_text))
-            for a in soup.find_all('a',href=True):
-              h=urljoin(rr.url,a['href']); t=' '.join(a.stripped_strings)
-              if ('statsId=' in h or 'serveyId=' in h or 'statmap-search/data' in h) and any(x in (t+h) for x in ['2010','500m','500ｍ','男女別人口総数','世帯総数','T000']):
-                discoveries.append({'text':t,'url':h})
-            # Also regex all IDs embedded in HTML; nearby context is saved for audit.
-            for m in re.finditer(r'(statsId|serveyId)=([A-Za-z0-9]+)',rr.text):
-              lo=max(0,m.start()-250); hi=min(len(rr.text),m.end()+250)
-              discoveries.append({'text':'HTML_CONTEXT '+re.sub(r'\s+',' ',rr.text[lo:hi]),'url':m.group(0)})
-          # dedup
-          seen=set(); dd=[]
-          for x in discoveries:
-            k=(x['text'],x['url'])
-            if k not in seen: seen.add(k); dd.append(x)
-          Path('out/estat_discoveries.json').write_text(json.dumps(dd,ensure_ascii=False,indent=2),encoding='utf-8')
-          ids=sorted(set(re.findall(r'T\d{6}',json.dumps(dd,ensure_ascii=False))))
-          surveys=sorted(set(re.findall(r'[A-Z]\d{12,}',json.dumps(dd,ensure_ascii=False))))
-          print('ESTAT_STATS_IDS',ids)
-          print('ESTAT_SURVEY_IDS',surveys[:30])
-          print('DISCOVERIES',len(dd))
+            r=s.get(u,timeout=60); print('JS',i,r.status_code,len(r.content),r.url); Path(f'out/gis_{i}.js').write_bytes(r.content)
+            if r.status_code==200 and len(r.text)>len(text): text=r.text
+          for i,line in enumerate(text.splitlines(),1):
+            if any(k in line for k in ['search_detail','search-detail','statmap-search','gis/', 'aggregateUnit','toukeiYear','statsId','serveyId','surveyId','statisticsTable']):
+              print('LINE',i,line[:4000])
+          eps=sorted(set(re.findall(r'["\']([^"\']*(?:gis|statmap)[^"\']*)["\']',text,re.I)))
+          Path('out/endpoints.txt').write_text('\n'.join(eps),encoding='utf-8')
+          print('ENDPOINTS',len(eps))
+          for x in eps: print('EP',x[:1000])
           PY
           sha256sum out/*
-      - name: Upload source audit evidence
+      - name: Upload endpoint audit
         uses: actions/upload-artifact@v4
         with:
-          name: transit-future-older-holdout-source-audit
+          name: transit-future-estat-endpoint-audit
           path: out/
           if-no-files-found: error
           retention-days: 2
