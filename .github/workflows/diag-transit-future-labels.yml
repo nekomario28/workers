@@ -1,4 +1,4 @@
-name: Diagnostic Transit Future N02 Label Audit
+name: Diagnostic Transit Future Census Mesh Probe
 
 on:
   pull_request:
@@ -6,146 +6,66 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
-  audit:
+  probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
-      - name: Audit annual N02 station additions
+      - name: Discover official e-Stat 2015 500m mesh download transport
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet 'requests==2.32.5' 'pyshp==2.3.1'
-          mkdir -p out work
+          python3 -m pip install --quiet 'requests==2.32.5' 'beautifulsoup4==4.13.4'
+          mkdir -p out input
+          curl --fail --location --silent --show-error \
+            -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' \
+            'https://api.github.com/repos/nekomario28/workers/actions/artifacts/9488732799/zip' -o /tmp/labels.zip
+          unzip -q /tmp/labels.zip -d input
           python3 - <<'PY'
-          import csv, hashlib, json, math, os, zipfile
-          from collections import Counter, defaultdict
+          import csv, json, re, requests
           from pathlib import Path
-          import requests, shapefile
-
-          YEARS=list(range(2011,2023))
-          MATCH_M=500; RELOCATION_NAME_M=20000; PRIOR_RAIL_M=200
-          SPECIAL_REVIEW_ROUTES={'大船渡線','気仙沼線'}
-          s=requests.Session(); s.headers['User-Agent']='Mozilla/5.0'
-
-          def hav(a,b,c,d):
-            R=6371000.; p1=math.radians(a); p2=math.radians(c); dp=math.radians(c-a); dl=math.radians(d-b)
-            q=math.sin(dp/2)**2+math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
-            return 2*R*math.asin(min(1,math.sqrt(q)))
-          def point_seg(lat,lon,a,b,c,d):
-            lat0=math.radians((lat+a+c)/3); sx=111320*math.cos(lat0); sy=110540
-            px,py=lon*sx,lat*sy; ax,ay=b*sx,a*sy; bx,by=d*sx,c*sy; vx,vy=bx-ax,by-ay; wx,wy=px-ax,py-ay
-            vv=vx*vx+vy*vy
-            if vv==0:return math.hypot(px-ax,py-ay)
-            t=max(0,min(1,(wx*vx+wy*vy)/vv)); return math.hypot(px-(ax+t*vx),py-(ay+t*vy))
-          def url(y):
-            yy=str(y)[-2:]; fn=f'N02-{yy}.zip' if y==2013 else f'N02-{yy}_GML.zip'
-            return f'https://nlftp.mlit.go.jp/ksj/gml/data/N02/N02-{yy}/{fn}'
-          def buckets(xs,step=.01):
-            z=defaultdict(list)
-            for x in xs:z[(math.floor(x['lat']/step),math.floor(x['lon']/step))].append(x)
-            return z
-          def near_any(x,b,step=.01,r=1):
-            iy=math.floor(x['lat']/step); ix=math.floor(x['lon']/step); best=None
-            for dy in range(-r,r+1):
-              for dx in range(-r,r+1):
-                for p in b.get((iy+dy,ix+dx),[]):
-                  d=hav(x['lat'],x['lon'],p['lat'],p['lon'])
-                  if best is None or d<best[0]:best=(d,p)
-            return best
-          def rail_buckets(segs,step=.02):
-            z=defaultdict(list)
-            for a,b,c,d in segs:
-              for iy in range(math.floor(min(a,c)/step),math.floor(max(a,c)/step)+1):
-                for ix in range(math.floor(min(b,d)/step),math.floor(max(b,d)/step)+1):z[(iy,ix)].append((a,b,c,d))
-            return z
-          def near_rail(x,z,step=.02):
-            iy=math.floor(x['lat']/step); ix=math.floor(x['lon']/step); best=None
-            for r in [0,1,2]:
-              for dy in range(-r,r+1):
-                for dx in range(-r,r+1):
-                  for seg in z.get((iy+dy,ix+dx),[]):
-                    d=point_seg(x['lat'],x['lon'],*seg)
-                    if best is None or d<best:best=d
-              if best is not None and best<5000:break
-            return best
-
-          snapshots={}; raw={}
-          for y in YEARS:
-            u=url(y); q=s.get(u,timeout=120); q.raise_for_status(); assert q.content[:2]==b'PK'
-            raw[y]={'url':u,'sha256':hashlib.sha256(q.content).hexdigest(),'bytes':len(q.content)}
-            p=Path(f'work/{y}.zip'); p.write_bytes(q.content); z=zipfile.ZipFile(p); names=z.namelist()
-            ss=[n for n in names if n.lower().endswith('.shp') and 'station' in os.path.basename(n).lower()][0]
-            rs=[n for n in names if n.lower().endswith('.shp') and 'railroadsection' in os.path.basename(n).lower()][0]
-            def ext(shp,prefix):
-              stem=shp[:-4]
-              for e in ['.shp','.shx','.dbf','.prj','.cpg']:
-                if stem+e in names:Path(f'work/{prefix}{e}').write_bytes(z.read(stem+e))
-            ext(ss,f's{y}'); ext(rs,f'r{y}')
-            sr=shapefile.Reader(f'work/s{y}.shp',encoding='cp932',encodingErrors='replace'); fields=[f[0] for f in sr.fields[1:]]
-            route_records=[]
-            for rec in sr.iterShapeRecords():
-              a=dict(zip(fields,rec.record)); pts=rec.shape.points
-              if not pts:continue
-              route_records.append({'name':str(a.get('N02_005') or '').strip(),'route':str(a.get('N02_003') or '').strip(),'operator':str(a.get('N02_004') or '').strip(),'type':str(a.get('N02_001') or '').strip(),'lon':sum(p[0] for p in pts)/len(pts),'lat':sum(p[1] for p in pts)/len(pts)})
-            uniq={}
-            for x in route_records:uniq[(x['name'],x['route'],x['operator'],x['type'],round(x['lon'],4),round(x['lat'],4))]=x
-            route_records=list(uniq.values()); physical=[]
-            for x in route_records:
-              hit=next((p for p in physical if p['name']==x['name'] and hav(p['lat'],p['lon'],x['lat'],x['lon'])<=300),None)
-              pair=(x['operator'],x['route'])
-              if hit:
-                n=hit['n']; hit['lon']=(hit['lon']*n+x['lon'])/(n+1); hit['lat']=(hit['lat']*n+x['lat'])/(n+1); hit['n']+=1; hit['pairs'].add(pair); hit['types'].add(x['type'])
-              else:physical.append({'name':x['name'],'lon':x['lon'],'lat':x['lat'],'n':1,'pairs':{pair},'types':{x['type']}})
-            rr=shapefile.Reader(f'work/r{y}.shp',encoding='cp932',encodingErrors='replace'); segs=[]
-            for sh in rr.shapes():
-              for i in range(len(sh.points)-1):a,b=sh.points[i],sh.points[i+1]; segs.append((a[1],a[0],b[1],b[0]))
-            snapshots[y]={'route':route_records,'physical':physical,'segs':segs}
-            print('SNAP',y,len(route_records),len(physical),len(segs))
-
-          audited=[]; byyear=[]
-          for y in YEARS[1:]:
-            prev,cur=snapshots[y-1],snapshots[y]; pb=buckets(prev['physical']); rb=rail_buckets(prev['segs']); prev_pairs={(x['operator'],x['route']) for x in prev['route']}; counts=Counter()
-            prev_by_name=defaultdict(list)
-            for p in prev['physical']:prev_by_name[p['name']].append(p)
-            for x in cur['physical']:
-              near=near_any(x,pb); dloc=near[0] if near else None
-              if dloc is not None and dloc<=MATCH_M:continue
-              same_name=[(hav(x['lat'],x['lon'],p['lat'],p['lon']),p) for p in prev_by_name.get(x['name'],[])]; same_name.sort(key=lambda q:q[0]); dname=same_name[0][0] if same_name else None
-              drail=near_rail(x,rb); old_pairs=sorted(x['pairs'] & prev_pairs); new_pairs=sorted(x['pairs'] - prev_pairs)
-              routes={r for o,r in x['pairs']}
-              special=bool(routes & SPECIAL_REVIEW_ROUTES)
-              if dname is not None and dname<=RELOCATION_NAME_M:
-                cls='relocation'
-              elif old_pairs and new_pairs:
-                cls='mixed_transfer'
-              elif old_pairs and drail is not None and drail<=PRIOR_RAIL_M:
-                cls='infill_candidate'
-              else:
-                cls='new_line_extension_candidate'
-              if special: cls=cls+'+special_review'
-              row={'snapshot_year':y,'station_name':x['name'],'latitude':x['lat'],'longitude':x['lon'],'rail_type_codes':' | '.join(sorted(x['types'])),'route_pairs':' | '.join(f'{o}:{r}' for o,r in sorted(x['pairs'])),'old_route_pairs':' | '.join(f'{o}:{r}' for o,r in old_pairs),'new_route_pairs':' | '.join(f'{o}:{r}' for o,r in new_pairs),'nearest_prior_station_m':round(dloc,1) if dloc is not None else '','same_name_prior_m':round(dname,1) if dname is not None else '','nearest_prior_rail_m':round(drail,1) if drail is not None else '','audit_class':cls}
-              audited.append(row); counts[cls]+=1
-            byyear.append({'year':y,**dict(counts)})
-            print('YEAR',y,dict(counts))
-          cols=['snapshot_year','station_name','latitude','longitude','rail_type_codes','route_pairs','old_route_pairs','new_route_pairs','nearest_prior_station_m','same_name_prior_m','nearest_prior_rail_m','audit_class']
-          with open('out/n02_station_additions_audited.csv','w',encoding='utf-8',newline='') as f:w=csv.DictWriter(f,fieldnames=cols);w.writeheader();w.writerows(audited)
-          classes=Counter(r['audit_class'] for r in audited)
-          with open('out/audit_class_counts.csv','w',encoding='utf-8',newline='') as f:w=csv.writer(f);w.writerow(['audit_class','count']);w.writerows(sorted(classes.items()))
-          Path('out/raw_sources.json').write_text(json.dumps(raw,ensure_ascii=False,indent=2),encoding='utf-8')
-          meta={'source':'MLIT N02 annual snapshots 2011-2022','commercial_source_policy':'N02 official page: commercial use permitted; 2020+ open data under applicable terms','same_location_match_m':MATCH_M,'same_name_relocation_search_m':RELOCATION_NAME_M,'prior_rail_infill_m':PRIOR_RAIL_M,'special_review_routes':sorted(SPECIAL_REVIEW_ROUTES),'classes':classes,'important':'audit_class is deterministic pre-model label hygiene, not a learned predictor. special_review must be manually resolved before freeze.'}
-          Path('out/meta.json').write_text(json.dumps(meta,ensure_ascii=False,indent=2,default=dict),encoding='utf-8')
-          print('GATE total',len(audited),'classes',dict(classes))
-          for r in audited:
-            if r['audit_class']!='infill_candidate':print('AUDIT',r)
-          assert len(audited)>0 and classes['infill_candidate']>0
+          from bs4 import BeautifulSoup
+          from urllib.parse import urljoin
+          labels=list(csv.DictReader(open('input/transit_future_gap_labels_2020_2025_v1.csv',encoding='utf-8')))
+          print('LABELS',len(labels),'POS',sum(r['label_status_v1']=='positive' for r in labels))
+          urls=[
+            'https://www.e-stat.go.jp/gis/statmap-search?page=1&type=1&toukeiCode=00200521&toukeiYear=2015&aggregateUnit=H&serveyId=H002005112015&statsId=T000847',
+            'https://www.e-stat.go.jp/gis/statmap-search?page=1&type=1&toukeiCode=00200521&toukeiYear=2015&aggregateUnit=H&serveyId=H002005112015&statsId=T000847&prefCode=27',
+          ]
+          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0','Accept-Language':'ja,en;q=0.8'})
+          all_links=[]
+          for i,u in enumerate(urls):
+            r=s.get(u,timeout=60); print('PAGE',i,r.status_code,len(r.content),r.url); r.raise_for_status(); Path(f'out/page{i}.html').write_bytes(r.content)
+            soup=BeautifulSoup(r.text,'html.parser')
+            for a in soup.find_all('a',href=True):
+              h=urljoin(r.url,a['href']); t=' '.join(a.stripped_strings)
+              if any(k in h.lower() for k in ['download','statmap','mesh','stats']) or any(k in t for k in ['ダウンロード','500m','人口']): all_links.append((i,t,h))
+            for tag in soup.find_all(True):
+              for k,v in tag.attrs.items():
+                vv=' '.join(v) if isinstance(v,list) else str(v)
+                if any(x in vv.lower() for x in ['download','t000847','h002005112015']): all_links.append((i,f'ATTR {tag.name} {k}',vv))
+          seen=set(); uniq=[]
+          for x in all_links:
+            if x not in seen:seen.add(x);uniq.append(x)
+          Path('out/links.tsv').write_text('\n'.join('\t'.join(map(str,x)) for x in uniq),encoding='utf-8')
+          print('LINKS',len(uniq))
+          for x in uniq[:300]:print('LINK',x)
+          # extract likely endpoint strings from raw HTML/scripts
+          text='\n'.join(Path(f'out/page{i}.html').read_text(encoding='utf-8',errors='replace') for i in range(len(urls)))
+          pats=sorted(set(re.findall(r'''["']([^"']*(?:download|statmap|statsData|mesh)[^"']*)["']''',text,re.I)))
+          Path('out/candidate_strings.txt').write_text('\n'.join(pats),encoding='utf-8')
+          print('CANDIDATE_STRINGS',len(pats))
+          for p in pats[:300]:print('STR',p[:1000])
           PY
           sha256sum out/*
-      - name: Upload audited labels
+      - name: Upload census mesh transport evidence
         uses: actions/upload-artifact@v4
         with:
-          name: transit-future-n02-label-audit
+          name: transit-future-census-mesh-probe
           path: out/
           if-no-files-found: error
           retention-days: 2
