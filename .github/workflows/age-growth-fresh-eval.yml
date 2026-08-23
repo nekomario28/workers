@@ -1,0 +1,54 @@
+name: age-growth-fresh-eval
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact transport head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Download frozen predictor-denominator and Physical sources
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/source /tmp/physical /tmp/out
+          curl --fail --silent --show-error --location \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/nekomario28/workers/actions/artifacts/9495808329/zip \
+            -o /tmp/source.zip
+          curl --fail --silent --show-error --location \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/nekomario28/workers/actions/artifacts/9481885906/zip \
+            -o /tmp/physical.zip
+          unzip -q /tmp/source.zip -d /tmp/source
+          unzip -q /tmp/physical.zip -d /tmp/physical
+
+      - name: Install pinned evaluation readers
+        run: python -m pip install --disable-pip-version-check xlrd==2.0.1 numpy==2.3.2
+
+      - name: Evaluate preregistered fresh holdout once
+        run: python scripts/age_growth_fresh_eval.py
+
+      - name: Upload fresh evaluation evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: age-growth-fresh-eval
+          path: /tmp/out/
+          if-no-files-found: error
+          retention-days: 2
