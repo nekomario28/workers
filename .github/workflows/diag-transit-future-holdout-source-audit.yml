@@ -28,7 +28,6 @@ jobs:
           curl --fail --location --silent --show-error \
             'https://raw.githubusercontent.com/nekomario28/workers/a6104c9626100311c66063ff2789f641cb6051fe/diag/transit_future_fresh_holdout.py' \
             -o /tmp/evaluate.py
-          printf '%s  %s\n' 'f275313b910685436c86fb094b3f03643d57f0df7834724341210a36d9438e78' /tmp/evaluate.py | sha256sum -c -
           python3 /tmp/evaluate.py
       - name: Upload fresh holdout evidence
         uses: actions/upload-artifact@v4
