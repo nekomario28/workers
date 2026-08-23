@@ -1,0 +1,167 @@
+name: Diagnostic Transit Future Labels
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  labels:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Materialize MLIT railway-history station opening labels
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet 'requests==2.32.5' 'beautifulsoup4==4.13.4' 'pyshp==2.3.1'
+          mkdir -p out work
+          python3 - <<'PY'
+          import csv, hashlib, json, math, os, re, zipfile
+          from collections import Counter, defaultdict
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests, shapefile
+          from bs4 import BeautifulSoup
+
+          PAGE='https://nlftp.mlit.go.jp/ksj/gml/datalist/KsjTmplt-N05-v2_0.html'
+          s=requests.Session(); s.headers['User-Agent']='Mozilla/5.0'
+          r=s.get(PAGE,timeout=60); r.raise_for_status()
+          soup=BeautifulSoup(r.text,'html.parser')
+          urls=[]
+          for a in soup.find_all('a',href=True):
+            h=urljoin(r.url,a['href'])
+            if 'N05-22_GML.zip' in h: urls.append(h)
+          urls += [
+            'https://nlftp.mlit.go.jp/ksj/gml/data/N05/N05-22/N05-22_GML.zip',
+            'https://nlftp.mlit.go.jp/ksj/gml/data/N05/N05-22/N05-22.zip',
+          ]
+          seen=set(); urls=[u for u in urls if not (u in seen or seen.add(u))]
+          data=None; src=None
+          for u in urls:
+            try:
+              rr=s.get(u,timeout=120)
+              print('PROBE',rr.status_code,len(rr.content),u)
+              if rr.status_code==200 and rr.content[:2]==b'PK': data=rr.content; src=u; break
+            except Exception as e: print('PROBE_ERROR',repr(e),u)
+          if data is None: raise SystemExit('N05-22 archive download failed')
+          raw_sha=hashlib.sha256(data).hexdigest(); Path('work/N05-22_GML.zip').write_bytes(data)
+          z=zipfile.ZipFile('work/N05-22_GML.zip')
+          names=z.namelist(); Path('out/zip_listing.txt').write_text('\n'.join(names),encoding='utf-8')
+          print('SOURCE',src); print('RAW_BYTES',len(data)); print('RAW_SHA256',raw_sha); print('ZIP_FILES',len(names))
+
+          def find_shp(token):
+            xs=[n for n in names if n.lower().endswith('.shp') and token.lower() in os.path.basename(n).lower()]
+            if not xs: raise SystemExit(f'missing shp: {token}')
+            return xs[0]
+          station_shp=find_shp('Station2'); rail_shp=find_shp('RailroadSection2')
+          def extract_family(shp_name, prefix):
+            stem=shp_name[:-4]
+            for ext in ['.shp','.shx','.dbf','.prj','.cpg']:
+              n=stem+ext
+              if n in names:
+                Path(f'work/{prefix}{ext}').write_bytes(z.read(n))
+          extract_family(station_shp,'station'); extract_family(rail_shp,'rail')
+
+          def reader(prefix):
+            # DBF text in this generation is CP932/Shift-JIS.
+            return shapefile.Reader(f'work/{prefix}.shp',encoding='cp932',encodingErrors='replace')
+          sr=reader('station'); rr=reader('rail')
+          sfields=[f[0] for f in sr.fields[1:]]; rfields=[f[0] for f in rr.fields[1:]]
+          Path('out/station_fields.json').write_text(json.dumps(sfields,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('out/rail_fields.json').write_text(json.dumps(rfields,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('STATION_FIELDS',sfields); print('RAIL_FIELDS',rfields)
+          required={'N05_002','N05_003','N05_004','N05_005b','N05_005e','N05_006','N05_011'}
+          if not required.issubset(sfields): raise SystemExit(f'station schema mismatch: {required-set(sfields)}')
+
+          def year(v):
+            if v in (None,''): return None
+            m=re.search(r'(19|20)\d{2}',str(v))
+            return int(m.group()) if m else None
+          route_events=[]
+          all_start=Counter()
+          for rec in sr.iterShapeRecords():
+            a=dict(zip(sfields,rec.record))
+            sy=year(a.get('N05_005b')); ly=year(a.get('N05_004')); ey=year(a.get('N05_005e'))
+            if sy: all_start[sy]+=1
+            if not sy or not (2013 <= sy <= 2022): continue
+            pts=rec.shape.points
+            lon,lat=(pts[0][0],pts[0][1]) if pts else (None,None)
+            route_events.append({
+              'relation_id':str(a.get('N05_006') or ''),
+              'station_name':str(a.get('N05_011') or ''),
+              'route_name':str(a.get('N05_002') or ''),
+              'operator':str(a.get('N05_003') or ''),
+              'route_service_start_year':ly,
+              'station_install_start_year':sy,
+              'station_install_end_year':ey,
+              'longitude':lon,'latitude':lat,
+              'infill_like_by_route_start': bool(ly and ly < sy),
+              'same_year_as_route_start': bool(ly and ly == sy),
+            })
+          # Deduplicate historical attribute variants by relation ID + opening year.
+          ded={}
+          for e in route_events:
+            k=(e['relation_id'],e['station_install_start_year'])
+            if k not in ded: ded[k]=e
+          route_events=list(ded.values())
+          route_events.sort(key=lambda x:(x['station_install_start_year'],x['station_name'],x['route_name'],x['relation_id']))
+
+          with open('out/station_route_openings_2013_2022.csv','w',encoding='utf-8',newline='') as f:
+            cols=list(route_events[0].keys()) if route_events else []
+            w=csv.DictWriter(f,fieldnames=cols); w.writeheader(); w.writerows(route_events)
+
+          # Approximate physical-station events: same opening year + same name + coordinates rounded to 0.001 deg.
+          physical={}
+          for e in route_events:
+            key=(e['station_install_start_year'],e['station_name'],round(e['longitude'] or 0,3),round(e['latitude'] or 0,3))
+            p=physical.setdefault(key,{
+              'station_install_start_year':e['station_install_start_year'],'station_name':e['station_name'],
+              'longitude':e['longitude'],'latitude':e['latitude'],'route_record_count':0,'routes':set(),
+              'any_infill_like':False,'all_same_year_route_start':True})
+            p['route_record_count']+=1; p['routes'].add(e['route_name'])
+            p['any_infill_like'] |= e['infill_like_by_route_start']
+            p['all_same_year_route_start'] &= e['same_year_as_route_start']
+          phys=[]
+          for p in physical.values():
+            p['routes']=' | '.join(sorted(x for x in p['routes'] if x)); phys.append(p)
+          phys.sort(key=lambda x:(x['station_install_start_year'],x['station_name']))
+          with open('out/physical_station_openings_2013_2022.csv','w',encoding='utf-8',newline='') as f:
+            cols=list(phys[0].keys()) if phys else []
+            w=csv.DictWriter(f,fieldnames=cols); w.writeheader(); w.writerows(phys)
+
+          byyear=defaultdict(lambda:Counter())
+          for p in phys:
+            y=p['station_install_start_year']; byyear[y]['physical']+=1
+            if p['any_infill_like']: byyear[y]['infill_like']+=1
+            if p['all_same_year_route_start']: byyear[y]['new_line_or_extension_like']+=1
+          with open('out/opening_counts_by_year.csv','w',encoding='utf-8',newline='') as f:
+            w=csv.writer(f); w.writerow(['year','physical_openings','infill_like','new_line_or_extension_like'])
+            for y in range(2013,2023): w.writerow([y,byyear[y]['physical'],byyear[y]['infill_like'],byyear[y]['new_line_or_extension_like']])
+
+          # Gate + metadata. This classification is deliberately only a first-pass label split.
+          assert len(route_events)>0 and len(phys)>0
+          assert all(2013<=x['station_install_start_year']<=2022 for x in phys)
+          meta={
+            'source_page':PAGE,'source_archive_url':src,'source_archive_sha256':raw_sha,
+            'station_shp':station_shp,'rail_shp':rail_shp,
+            'route_opening_records_2013_2022':len(route_events),'physical_station_openings_2013_2022':len(phys),
+            'classification_rule':'first-pass only: infill_like if route service start year < station install start year; same-year is new-line/extension-like. Must be refined with local section geometry before model evaluation.',
+            'license_warning':'MLIT N05 historical railway dataset page states non-commercial use only due to incorporated paid-source material.'
+          }
+          Path('out/meta.json').write_text(json.dumps(meta,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('GATE route_events',len(route_events),'physical_events',len(phys))
+          print('BY_YEAR',json.dumps({y:dict(byyear[y]) for y in sorted(byyear)},ensure_ascii=False))
+          for p in phys[:40]: print('EVENT',p)
+          for p in phys[-40:]: print('EVENT_LAST',p)
+          PY
+          sha256sum out/*
+      - name: Upload Transit Future label evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: transit-future-labels
+          path: out/
+          if-no-files-found: error
+          retention-days: 2
