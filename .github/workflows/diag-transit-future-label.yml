@@ -1,4 +1,4 @@
-name: Diagnostic Transit Future N02 XML Encoding Audit
+name: Diagnostic Transit Future N02 GML Relation Audit CP932
 
 on:
   pull_request:
@@ -12,44 +12,51 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Inspect N02-20 XML declaration and invalid token
+      - name: Parse N02-20 GML relations after verified CP932 decode
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import hashlib, io, json, requests, zipfile
+          import hashlib, io, json, requests, zipfile, xml.etree.ElementTree as ET
           from pathlib import Path
           u='https://nlftp.mlit.go.jp/ksj/gml/data/N02/N02-20/N02-20_GML.zip'
           r=requests.get(u,headers={'User-Agent':'Mozilla/5.0'},timeout=120); r.raise_for_status()
           z=zipfile.ZipFile(io.BytesIO(r.content)); target='N02-20_GML/N02-20.xml'; b=z.read(target)
-          print('ZIP_SHA',hashlib.sha256(r.content).hexdigest(),'XML_BYTES',len(b))
-          print('HEAD_HEX',b[:512].hex())
-          print('HEAD_REPR',repr(b[:2048]))
-          results={}
-          for enc in ['utf-8','cp932','shift_jis','euc_jp','iso2022_jp']:
-            try:
-              s=b[:8192].decode(enc)
-              results[enc]={'ok':True,'head':s[:3000]}
-              print('DECODE',enc,'OK',repr(s[:1500]))
-            except Exception as e:
-              results[enc]={'ok':False,'error':repr(e)}
-              print('DECODE',enc,'FAIL',repr(e))
-          # Show raw bytes around parser failure location: line 8, col 17 from prior run.
-          lines=b.splitlines(keepends=True)
-          for i in range(min(12,len(lines))):
-            print('RAW_LINE',i+1,repr(lines[i][:1000]))
-          if len(lines)>=8:
-            ln=lines[7]
-            print('LINE8_HEX',ln[:256].hex())
-          out={'source_url':u,'zip_sha256':hashlib.sha256(r.content).hexdigest(),'xml_size':len(b),'decode_results':results,
-               'raw_first_lines_repr':[repr(x[:2000]) for x in lines[:12]]}
-          p=Path('encoding_audit.json'); p.write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          # Prior exact-head diagnostic proved the file falsely declares UTF-8 while bytes are CP932.
+          s=b.decode('cp932')
+          sample={'RailroadSection':None,'Station':None}; counts={'RailroadSection':0,'Station':0}; child_tags={}
+          hrefs={'RailroadSection':[],'Station':[]}; attrs={}
+          XLINK='{http://www.w3.org/1999/xlink}href'
+          for ev,el in ET.iterparse(io.StringIO(s),events=('end',)):
+            local=el.tag.split('}')[-1]
+            if local in sample:
+              counts[local]+=1
+              if sample[local] is None:
+                sample[local]=ET.tostring(el,encoding='unicode')[:16000]
+                child_tags[local]=[c.tag.split('}')[-1] for c in list(el)]
+                attrs[local]=dict(el.attrib)
+                for d in el.iter():
+                  if XLINK in d.attrib:
+                    hrefs[local].append({'tag':d.tag.split('}')[-1],'href':d.attrib[XLINK]})
+              el.clear()
+          print('COUNTS',counts)
+          print('CHILD_TAGS',json.dumps(child_tags,ensure_ascii=False))
+          print('HREFS',json.dumps(hrefs,ensure_ascii=False))
+          print('ATTRS',json.dumps(attrs,ensure_ascii=False))
+          print('RAILROAD_SAMPLE',sample['RailroadSection'])
+          print('STATION_SAMPLE',sample['Station'])
+          if counts['RailroadSection']==0 or counts['Station']==0: raise SystemExit('expected feature types absent')
+          out={'source_url':u,'zip_sha256':hashlib.sha256(r.content).hexdigest(),'xml_sha256':hashlib.sha256(b).hexdigest(),
+               'verified_actual_encoding':'cp932','declared_encoding':'UTF-8 (incorrect in source)',
+               'counts':counts,'child_tags':child_tags,'xlink_hrefs':hrefs,'attrs':attrs,
+               'railroad_sample':sample['RailroadSection'],'station_sample':sample['Station']}
+          p=Path('relation_audit_cp932.json'); p.write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
           print('SUMMARY_SHA',hashlib.sha256(p.read_bytes()).hexdigest())
           PY
-      - name: Upload encoding audit
+      - name: Upload repaired relation audit
         uses: actions/upload-artifact@v4
         with:
-          name: transit-future-n02-xml-encoding-audit
-          path: encoding_audit.json
+          name: transit-future-n02-gml-relation-audit-cp932
+          path: relation_audit_cp932.json
           if-no-files-found: error
           retention-days: 1
