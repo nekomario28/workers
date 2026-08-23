@@ -1,0 +1,71 @@
+name: age-growth-temporal-outcome-source-audit
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch exact e-Stat source bytes without parsing outcome values
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/source
+          fetch() {
+            id="$1"; out="$2"
+            curl --fail --silent --show-error --location \
+              --retry 3 --retry-all-errors \
+              -H 'User-Agent: Mozilla/5.0' \
+              "https://www.e-stat.go.jp/stat-search/file-download?fileKind=0&statInfId=${id}" \
+              -o "/tmp/source/${out}"
+            test -s "/tmp/source/${out}"
+          }
+          fetch 000040273624 FY2024_7-2_apr-dec.xls
+          fetch 000040273625 FY2024_7-2-2_jan-mar.xls
+          fetch 000040451288 FY2025_7-2-2_full-year.xls
+          sha256sum /tmp/source/*.xls | sort > /tmp/source/SHA256SUMS
+          python - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          root=Path('/tmp/source')
+          specs=[
+            ('000040273624','FY2024_7-2_apr-dec.xls','2025-04-30 14:00','2024-04-01..2024-12-31'),
+            ('000040273625','FY2024_7-2-2_jan-mar.xls','2025-06-30 14:00','2025-01-01..2025-03-31'),
+            ('000040451288','FY2025_7-2-2_full-year.xls','2026-04-30','2025-04-01..2026-03-31'),
+          ]
+          files=[]
+          for sid,name,pub,coverage in specs:
+              p=root/name
+              files.append({
+                  'statInfId':sid,
+                  'file':name,
+                  'publication':pub,
+                  'coverage':coverage,
+                  'size_bytes':p.stat().st_size,
+                  'sha256':hashlib.sha256(p.read_bytes()).hexdigest(),
+              })
+          receipt={
+              'status':'SOURCE_BYTES_FROZEN_WITHOUT_OUTCOME_PARSE',
+              'canonical_preregistration_commit':'c935789e105a0476c05ff24ff599a42660a35491',
+              'canonical_predictor_freeze_commit':'d8768eb08f7e71484669c27a230bf3cde757f707',
+              'source_family':'Building Starts Statistics table 7-2 / 7-2-2 municipality-by-use large category',
+              'files':files,
+              'outcome_values_parsed':False,
+          }
+          (root/'source_receipt.json').write_text(json.dumps(receipt,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+          print(json.dumps(receipt,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Upload source-byte freeze
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: age-growth-temporal-outcome-source-bytes
+          path: /tmp/source/
+          if-no-files-found: error
+          retention-days: 2
