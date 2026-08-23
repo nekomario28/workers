@@ -1,4 +1,4 @@
-name: Diagnostic Transit Future Commercial N02 Positive Freeze
+name: Diagnostic Transit Future Continuous Rail Infill Audit
 
 on:
   pull_request:
@@ -11,9 +11,9 @@ permissions:
 jobs:
   audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
-      - name: Validate future station positives in to-year N02 snapshots
+      - name: Audit continuous local rail geometry for infill positives
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -25,9 +25,9 @@ jobs:
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2022-11-28' \
-            'https://api.github.com/repos/nekomario28/workers/actions/artifacts/9481895787/zip' \
-            -o /tmp/v4.zip
-          unzip -q /tmp/v4.zip -d input
+            'https://api.github.com/repos/nekomario28/workers/actions/artifacts/9488504736/zip' \
+            -o /tmp/v1.zip
+          unzip -q /tmp/v1.zip -d input
           python3 - <<'PY'
           import csv, hashlib, io, json, math, requests, unicodedata, zipfile
           from collections import Counter, defaultdict
@@ -35,24 +35,20 @@ jobs:
           from pathlib import Path
           import shapefile
 
-          SRC=Path('input/n02_historical_service_identity_v4.csv')
-          SRC_SHA='6569b697b698a738eab867967e014ec7754ffff0cf4241f75d6f4341c21559db'
+          SRC=Path('input/transit_future_positive_labels_v1.csv')
+          SRC_SHA='2d33b20b8cdfbb75621e62d86dc562af9d5c41e9855c8a8c753f0fa1f7a423f7'
           if hashlib.sha256(SRC.read_bytes()).hexdigest()!=SRC_SHA:
-            raise SystemExit('v4 input SHA mismatch')
+            raise SystemExit('positive-v1 input SHA mismatch')
           rows=list(csv.DictReader(SRC.open(encoding='utf-8')))
           if len(rows)!=195: raise SystemExit(f'expected 195 rows, got {len(rows)}')
 
+          # Fixed before this audit. 150 m tolerates annual geometry simplification while
+          # remaining far below ordinary inter-station distances. This is a data-quality
+          # boundary, not a performance-tuned threshold.
+          CONTINUITY_M=150.0
+          ALLOWED={'11','12','13','14','15','16','21','22','23','24','25'}
+
           def norm(x): return ''.join(unicodedata.normalize('NFKC',str(x or '')).split())
-          def hav(a,b):
-            lat1,lon1=a; lat2,lon2=b; R=6371000.0
-            p1=math.radians(lat1); p2=math.radians(lat2)
-            dp=math.radians(lat2-lat1); dl=math.radians(lon2-lon1)
-            q=math.sin(dp/2)**2+math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
-            return 2*R*math.asin(min(1,math.sqrt(q)))
-          def center(points):
-            if not points: return None
-            xs=[p[0] for p in points]; ys=[p[1] for p in points]
-            return ((min(ys)+max(ys))/2,(min(xs)+max(xs))/2)
           def urls_for(y):
             yy=y%100
             return [f'https://nlftp.mlit.go.jp/ksj/gml/data/N02/N02-{yy:02d}/N02-{yy:02d}_GML.zip',
@@ -66,104 +62,137 @@ jobs:
                 last=f'{r.status_code} {r.content[:16]!r}'
               except Exception as e: last=repr(e)
             raise RuntimeError(f'{y}: {last}')
-          def parse_station_zip(y,b):
-            z=zipfile.ZipFile(io.BytesIO(b)); names=z.namelist()
-            station_files=sorted([n for n in names if n.lower().endswith('station.shp')],key=lambda n:(0 if '/UTF-8/' in n else 1,n))
-            if not station_files: station_files=sorted([n for n in names if 'station' in n.lower() and n.lower().endswith('.shp')])
-            rdr=None; used=None
-            for shp in station_files:
+          def open_reader(z, names, candidates):
+            files=[]
+            for n in names:
+              lo=n.lower()
+              if lo.endswith('.shp') and any(k in lo for k in candidates): files.append(n)
+            files=sorted(files,key=lambda n:(0 if '/utf-8/' in n.lower() else 1,n))
+            for shp in files:
               base=shp[:-4]
               need={e:next((n for n in names if n.lower()==(base+e).lower()),None) for e in ['.shp','.shx','.dbf']}
               if not all(need.values()): continue
-              for enc in (['utf-8','cp932'] if '/UTF-8/' in shp else ['cp932','utf-8']):
+              for enc in (['utf-8','cp932'] if '/utf-8/' in shp.lower() else ['cp932','utf-8']):
                 try:
-                  x=shapefile.Reader(shp=io.BytesIO(z.read(need['.shp'])),shx=io.BytesIO(z.read(need['.shx'])),dbf=io.BytesIO(z.read(need['.dbf'])),encoding=enc)
-                  if len(x): _=x.record(0)
-                  rdr=x; used=(shp,enc); break
+                  rdr=shapefile.Reader(shp=io.BytesIO(z.read(need['.shp'])),shx=io.BytesIO(z.read(need['.shx'])),dbf=io.BytesIO(z.read(need['.dbf'])),encoding=enc)
+                  if len(rdr): _=rdr.record(0)
+                  return rdr,shp,enc
                 except UnicodeDecodeError: pass
-              if rdr is not None: break
-            if rdr is None: raise SystemExit(f'{y}: station decode failure')
+            return None,None,None
+          def point_seg_m(lat,lon,a,b):
+            # local equirectangular projection around the candidate point
+            R=6371000.0; cl=math.cos(math.radians(lat))
+            ax=math.radians(a[0]-lon)*R*cl; ay=math.radians(a[1]-lat)*R
+            bx=math.radians(b[0]-lon)*R*cl; by=math.radians(b[1]-lat)*R
+            vx=bx-ax; vy=by-ay; den=vx*vx+vy*vy
+            if den<=1e-12: return math.hypot(ax,ay)
+            t=max(0.0,min(1.0,-(ax*vx+ay*vy)/den))
+            return math.hypot(ax+t*vx,ay+t*vy)
+          def shape_dist_m(lat,lon,shape):
+            pts=shape.points
+            if not pts: return float('inf')
+            starts=list(shape.parts)+[len(pts)]; best=float('inf')
+            for pi in range(len(starts)-1):
+              part=pts[starts[pi]:starts[pi+1]]
+              if len(part)==1:
+                best=min(best,point_seg_m(lat,lon,part[0],part[0]))
+              else:
+                for a,b in zip(part,part[1:]): best=min(best,point_seg_m(lat,lon,a,b))
+            return best
+          def parse_sections(y,b):
+            z=zipfile.ZipFile(io.BytesIO(b)); names=z.namelist()
+            rdr,src,enc=open_reader(z,names,['railroadsection','railwaysection'])
+            if rdr is None: raise SystemExit(f'{y}: RailroadSection shapefile not found')
             fields=[f[0] for f in rdr.fields[1:]]
-            for need in ['N02_001','N02_003','N02_004','N02_005']:
-              if need not in fields: raise SystemExit(f'{y}: missing {need}; fields={fields}')
-            byname=defaultdict(list)
+            for need in ['N02_001','N02_003','N02_004']:
+              if need not in fields: raise SystemExit(f'{y}: section missing {need}; fields={fields}')
+            byline=defaultdict(list); n=0
             for sr in rdr.iterShapeRecords():
-              d=dict(zip(fields,sr.record)); pt=center(sr.shape.points)
-              if pt is None: continue
-              name=norm(d.get('N02_005'))
-              if not name: continue
-              byname[name].append({'pt':pt,'type':str(d.get('N02_001','')).strip(),
-                                   'line':norm(d.get('N02_003')),'op':norm(d.get('N02_004')),
-                                   'raw_name':str(d.get('N02_005',''))})
-            return byname, {'rows':sum(len(v) for v in byname.values()),'source':used[0],'encoding':used[1]}
+              d=dict(zip(fields,sr.record)); typ=str(d.get('N02_001','')).strip()
+              if typ not in ALLOWED: continue
+              line=norm(d.get('N02_003')); op=norm(d.get('N02_004'))
+              if not line: continue
+              byline[line].append({'shape':sr.shape,'op':op,'type':typ}); n+=1
+            return byline, {'rows':n,'source':src,'encoding':enc}
 
-          years=sorted({int(r['to_year']) for r in rows})
-          blobs={}; urls={}; raw_sha={}
-          with ThreadPoolExecutor(max_workers=3) as ex:
+          # Existing-line positives need every annual snapshot from cutoff through to-year.
+          infill=[r for r in rows if r['high_precision_positive']=='True' and r['class']=='existing_line_infill_candidate']
+          years=sorted({y for r in infill for y in range(int(r['from_year']),int(r['to_year'])+1)})
+          blobs={}; urls={}; shas={}
+          with ThreadPoolExecutor(max_workers=4) as ex:
             futs={ex.submit(fetch,y):y for y in years}
             for fut in as_completed(futs):
-              y,u,b=fut.result(); blobs[y]=b; urls[y]=u; raw_sha[y]=hashlib.sha256(b).hexdigest()
-              print('FETCH',y,len(b),raw_sha[y],u)
-          if set(blobs)!=set(years): raise SystemExit('to-year coverage incomplete')
-          snapshots={}; parse_meta={}
+              y,u,b=fut.result(); blobs[y]=b; urls[y]=u; shas[y]=hashlib.sha256(b).hexdigest(); print('FETCH',y,len(b),shas[y])
+          if set(blobs)!=set(years): raise SystemExit('annual snapshot coverage incomplete')
+          sections={}; parse={}
           for y in years:
-            snapshots[y],parse_meta[y]=parse_station_zip(y,blobs[y]); print('PARSE',y,parse_meta[y])
+            sections[y],parse[y]=parse_sections(y,blobs[y]); print('PARSE',y,parse[y])
 
-          allowed_types={'11','12','13','14','15','16','21','22','23','24','25'}
-          out=[]; reason=Counter(); class_keep=Counter(); missing=[]
-          for r in rows:
-            cls=r['class']; near300=(r['near_prior_station_300m']=='True')
-            base_keep=(cls in ('new_line_candidate','extension_candidate')) or (cls=='existing_line_infill_candidate' and not near300)
-            prior_clean=(r['n02_prior_service_diag']=='no_prior_same_service')
+          continuity={}; rejected=[]; counts=Counter()
+          for r in infill:
             pairs=[]
             for token in r['future_operator_lines'].split(';'):
               if '/' in token:
                 op,line=token.split('/',1); pairs.append((norm(op),norm(line)))
-            pt=(float(r['lat']),float(r['lon'])); matches=[]
-            for cand in snapshots[int(r['to_year'])].get(norm(r['future_station']),[]):
-              pair_match=any(cand['op']==op and cand['line']==line for op,line in pairs)
-              line_match=any(cand['line']==line for op,line in pairs)
-              if pair_match or line_match:
-                matches.append({**cand,'distance_m':round(hav(pt,cand['pt']),2),'pair_match':pair_match,'line_match':line_match})
-            exact=[m for m in matches if m['pair_match']]
-            use=exact or matches
-            types=sorted({m['type'] for m in use})
-            min_dist=min((m['distance_m'] for m in use),default=None)
-            present=bool(use) and min_dist is not None and min_dist<=1000
-            railtype=present and any(t in allowed_types for t in types)
-            high=base_keep and prior_clean and present and railtype
-            if not base_keep: why='topology_reject'
-            elif not prior_clean: why='prior_same_service'
-            elif not present: why='missing_from_to_year_n02'
-            elif not railtype: why='non_rail_type'
-            else: why='high_precision_positive'
-            reason[why]+=1
-            if high: class_keep[cls]+=1
-            if base_keep and prior_clean and not high:
-              missing.append({'from_year':r['from_year'],'to_year':r['to_year'],'station':r['future_station'],'class':cls,'reason':why,'types':types,'min_distance_m':min_dist,'future_operator_lines':r['future_operator_lines']})
-            out.append({**r,'to_year_n02_present':present,'to_year_n02_types':';'.join(types),
-                        'to_year_n02_min_distance_m':'' if min_dist is None else min_dist,
-                        'high_precision_positive':high,'positive_reason':why})
+            lat=float(r['lat']); lon=float(r['lon']); per=[]
+            for y in range(int(r['from_year']),int(r['to_year'])+1):
+              candidates=[]
+              for op,line in pairs:
+                for seg in sections[y].get(line,[]):
+                  # Same line is sufficient spatially; exact operator is preferred diagnostically.
+                  d=shape_dist_m(lat,lon,seg['shape'])
+                  candidates.append((d,seg['op']==op,seg['op'],seg['type'],line))
+              candidates.sort(key=lambda x:(x[0],not x[1]))
+              if candidates:
+                d,exact,op,typ,line=candidates[0]
+                per.append({'year':y,'distance_m':round(d,2),'exact_operator':exact,'operator':op,'type':typ,'line':line})
+              else:
+                per.append({'year':y,'distance_m':None,'exact_operator':False,'operator':'','type':'','line':''})
+            continuous=all(x['distance_m'] is not None and x['distance_m']<=CONTINUITY_M for x in per)
+            bad=[x for x in per if x['distance_m'] is None or x['distance_m']>CONTINUITY_M]
+            continuity[(r['from_year'],r['to_year'],r['future_station'],r['lat'],r['lon'])]=(continuous,per)
+            counts['continuous' if continuous else 'discontinuous']+=1
+            if not continuous:
+              rejected.append({'from_year':r['from_year'],'to_year':r['to_year'],'station':r['future_station'],'operator_lines':r['future_operator_lines'],'bad_years':bad})
 
-          fields=list(rows[0].keys())+['to_year_n02_present','to_year_n02_types','to_year_n02_min_distance_m','high_precision_positive','positive_reason']
-          p=Path('out/transit_future_positive_labels_v1.csv')
+          out=[]; final_counts=Counter()
+          for r in rows:
+            key=(r['from_year'],r['to_year'],r['future_station'],r['lat'],r['lon'])
+            cont,per=continuity.get(key,(None,[]))
+            hp=(r['high_precision_positive']=='True')
+            if r['class']=='existing_line_infill_candidate':
+              final=hp and cont is True
+              reason='continuous_existing_line_infill' if final else ('discontinuous_local_rail' if hp else r['positive_reason'])
+            else:
+              final=hp
+              reason=r['positive_reason'] if hp else r['positive_reason']
+            if final: final_counts[r['class']]+=1
+            out.append({**r,'continuous_local_rail': '' if cont is None else cont,
+                        'continuity_trace_json':json.dumps(per,ensure_ascii=False,separators=(',',':')) if per else '',
+                        'final_positive_v2':final,'final_positive_reason_v2':reason})
+
+          fields=list(rows[0].keys())+['continuous_local_rail','continuity_trace_json','final_positive_v2','final_positive_reason_v2']
+          p=Path('out/transit_future_positive_labels_v2.csv')
           with p.open('w',encoding='utf-8',newline='') as f:
             w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(out)
-          summary={'input_v4_sha256':SRC_SHA,'to_years':years,'snapshot_urls':urls,'snapshot_sha256':raw_sha,
-                   'parse_meta':parse_meta,'reason_counts':dict(reason),'high_precision_by_class':dict(class_keep),
-                   'rejected_after_base_clean':missing,'csv_sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
-          Path('out/transit_future_positive_labels_v1_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
-          print('REASON_COUNTS',json.dumps(dict(reason),ensure_ascii=False))
-          print('HIGH_PRECISION_BY_CLASS',json.dumps(dict(class_keep),ensure_ascii=False))
-          print('REJECTED_AFTER_BASE_CLEAN',json.dumps(missing,ensure_ascii=False))
+          summary={'input_v1_sha256':SRC_SHA,'continuity_threshold_m':CONTINUITY_M,'annual_years':years,
+                   'snapshot_urls':urls,'snapshot_sha256':shas,'parse_meta':parse,
+                   'infill_continuity_counts':dict(counts),'rejected_infill':rejected,
+                   'final_positive_by_class':dict(final_counts),'final_positive_total':sum(final_counts.values()),
+                   'csv_sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
+          Path('out/transit_future_positive_labels_v2_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('INFILL_CONTINUITY',json.dumps(dict(counts),ensure_ascii=False))
+          print('REJECTED_INFILL',json.dumps(rejected,ensure_ascii=False))
+          print('FINAL_POSITIVE_BY_CLASS',json.dumps(dict(final_counts),ensure_ascii=False))
+          print('FINAL_POSITIVE_TOTAL',sum(final_counts.values()))
           print('CSV_SHA',summary['csv_sha256'])
           if len(out)!=195: raise SystemExit('row coverage failure')
           PY
           sha256sum out/*
-      - name: Upload commercial-safe positive freeze
+      - name: Upload continuous-rail positive audit
         uses: actions/upload-artifact@v4
         with:
-          name: transit-future-positive-labels-v1
+          name: transit-future-positive-labels-v2
           path: out/
           if-no-files-found: error
           retention-days: 1
