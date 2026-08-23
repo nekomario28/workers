@@ -2,22 +2,15 @@ import csv
 import hashlib
 import json
 import math
-import re
-import zipfile
 from pathlib import Path
-from xml.etree import ElementTree as ET
 
+import openpyxl
 import xlrd
 
 OUT = Path('/tmp/out')
 OUT.mkdir(parents=True, exist_ok=True)
-NS = {
-    'm': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
-    'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
-    'pr': 'http://schemas.openxmlformats.org/package/2006/relationships',
-}
 
-REGIONS = [
+FRESH_REGIONS = [
     ('01101','札幌市中央区','Sapporo'),('01102','札幌市北区','Sapporo'),
     ('01103','札幌市東区','Sapporo'),('01104','札幌市白石区','Sapporo'),
     ('01105','札幌市豊平区','Sapporo'),('01106','札幌市南区','Sapporo'),
@@ -35,158 +28,90 @@ REGIONS = [
     ('26109','京都市伏見区','Kyoto'),('26110','京都市山科区','Kyoto'),
     ('26111','京都市西京区','Kyoto'),
 ]
-if len(REGIONS) != 30 or len({r[0] for r in REGIONS}) != 30:
-    raise SystemExit('invalid region universe')
+SPATIAL_CODES = [
+    *[(c, 'Osaka') for c in ['27102','27103','27104','27106','27107','27108','27109','27111','27113','27114','27115','27116','27117','27118','27119','27120','27121','27122','27123','27124','27125','27126','27127','27128']],
+    *[(f'231{i:02d}', 'Nagoya') for i in range(1,17)],
+]
+if len(FRESH_REGIONS) != 30 or len(SPATIAL_CODES) != 40:
+    raise SystemExit('invalid frozen region sets')
 
 
-def norm_code(v):
-    if v is None:
-        return None
-    s = str(v).strip()
+def code5(v):
+    s = str(v or '').strip()
     if s.endswith('.0'):
         s = s[:-2]
-    d = re.sub(r'\D', '', s)
-    if not d:
-        return None
-    return d.zfill(6)[:5]
+    return s[:5] if len(s) >= 5 and s[:5].isdigit() else None
 
 
-def norm_header(v):
-    if v is None:
-        return ''
-    return re.sub(r'[\s　]+', '', str(v))
+def load_age_rows(path):
+    p = Path(path)
+    blob = p.read_bytes()
+    if blob[:4] == b'PK\x03\x04':
+        wb = openpyxl.load_workbook(p, data_only=True, read_only=True)
+        ws = wb.worksheets[0]
+        return [tuple(r) for r in ws.iter_rows(values_only=True)], 'OOXML'
+    if blob[:8] == bytes.fromhex('D0CF11E0A1B11AE1'):
+        wb = xlrd.open_workbook(file_contents=blob)
+        sh = wb.sheet_by_index(0)
+        return [tuple(sh.row_values(i)) for i in range(sh.nrows)], 'BIFF8/OLE'
+    raise SystemExit(f'unknown excel signature {p.name} {blob[:8]!r}')
 
 
-def find_age_columns(rows):
-    found = {}
-    for row in rows[:12]:
-        for col, value in row.items():
-            h = norm_header(value)
-            if '団体コード' in h:
-                found['code'] = col
-            if h == '性別' or '性別' in h:
-                found['sex'] = col
-            if ('20歳' in h and '24歳' in h) or ('20～24' in h) or ('20-24' in h):
-                found['20_24'] = col
-            if ('25歳' in h and '29歳' in h) or ('25～29' in h) or ('25-29' in h):
-                found['25_29'] = col
-    missing = {'code','sex','20_24','25_29'} - set(found)
-    if missing:
-        raise SystemExit(f'age header columns missing {missing}; found={found}')
-    if found['20_24'] == found['25_29']:
-        raise SystemExit(f'age columns collided: {found}')
-    return found
-
-
-def xls_rows(path):
-    wb = xlrd.open_workbook(path, on_demand=True)
-    sh = wb.sheet_by_index(0)
-    rows = [{j: sh.cell_value(i,j) for j in range(sh.ncols)} for i in range(sh.nrows)]
-    sheet_name = sh.name
-    wb.release_resources()
-    return rows, sheet_name
-
-
-def col_index(ref):
-    letters = re.match(r'[A-Z]+', ref).group(0)
-    n = 0
-    for ch in letters:
-        n = n * 26 + (ord(ch) - 64)
-    return n - 1
-
-
-def xlsx_rows(path):
-    with zipfile.ZipFile(path) as z:
-        shared = []
-        if 'xl/sharedStrings.xml' in z.namelist():
-            root = ET.fromstring(z.read('xl/sharedStrings.xml'))
-            for si in root.findall('m:si', NS):
-                shared.append(''.join(t.text or '' for t in si.iter('{%s}t' % NS['m'])))
-        wb = ET.fromstring(z.read('xl/workbook.xml'))
-        first = wb.find('m:sheets/m:sheet', NS)
-        rid = first.attrib['{%s}id' % NS['r']]
-        sheet_name = first.attrib.get('name')
-        rels = ET.fromstring(z.read('xl/_rels/workbook.xml.rels'))
-        target = None
-        for rel in rels.findall('pr:Relationship', NS):
-            if rel.attrib.get('Id') == rid:
-                target = rel.attrib['Target']
-                break
-        if not target:
-            raise SystemExit('xlsx sheet relation missing')
-        sheet_path = target.lstrip('/') if target.startswith('/xl/') else 'xl/' + target.lstrip('/')
-        root = ET.fromstring(z.read(sheet_path))
-        rows = []
-        for row in root.findall('.//m:sheetData/m:row', NS):
-            vals = {}
-            for c in row.findall('m:c', NS):
-                idx = col_index(c.attrib['r'])
-                typ = c.attrib.get('t')
-                if typ == 'inlineStr':
-                    node = c.find('m:is', NS)
-                    val = ''.join(t.text or '' for t in node.iter('{%s}t' % NS['m'])) if node is not None else ''
-                else:
-                    v = c.find('m:v', NS)
-                    raw = v.text if v is not None else None
-                    if raw is None:
-                        val = None
-                    elif typ == 's':
-                        val = shared[int(raw)]
-                    else:
-                        try:
-                            val = float(raw)
-                        except Exception:
-                            val = raw
-                vals[idx] = val
-            rows.append(vals)
-        return rows, sheet_name
-
-
-def age_map(rows):
-    cols = find_age_columns(rows)
+def age_rows(rows, targets):
     out = {}
     for row in rows:
-        code = norm_code(row.get(cols['code']))
-        sex = str(row.get(cols['sex'], '')).strip()
-        if not code or sex != '計':
+        if len(row) <= 10:
             continue
-        try:
-            a = float(row[cols['20_24']])
-            b = float(row[cols['25_29']])
-        except Exception:
+        c = code5(row[0])
+        if c not in targets:
             continue
-        if math.isfinite(a) and math.isfinite(b):
-            out[code] = a + b
-    return out, cols
+        sex = str(row[3] or '').strip()
+        if sex != '計':
+            continue
+        if c in out:
+            raise SystemExit(f'duplicate age total row {c}')
+        total = float(row[4])
+        a20 = float(row[9])
+        a25 = float(row[10])
+        out[c] = {'total': total, 'age20_29': a20 + a25}
+    return out
 
 
-rows20, sheet20 = xls_rows('/tmp/demand/2020_age.xls')
-rows21, sheet21 = xlsx_rows('/tmp/demand/2021_age.xlsx')
-age20, cols20 = age_map(rows20)
-age21, cols21 = age_map(rows21)
+temporal_refs = {
+    '13101': 0.48237050648902713,
+    '13108': 2.687494452826833,
+    '40133': 1.9956887559974934,
+    '40135': -1.2308521629756042,
+}
+all_age_targets = {c for c,_,_ in FRESH_REGIONS} | {c for c,_ in SPATIAL_CODES} | set(temporal_refs)
+rows20, fmt20 = load_age_rows('/tmp/demand/2020_age.xls')
+rows21, fmt21 = load_age_rows('/tmp/demand/2021_age.xlsx')
+a20 = age_rows(rows20, all_age_targets)
+a21 = age_rows(rows21, all_age_targets)
+missing20 = sorted(all_age_targets - set(a20))
+missing21 = sorted(all_age_targets - set(a21))
+if missing20 or missing21:
+    raise SystemExit(f'age coverage mismatch 2020={missing20} 2021={missing21}')
 
 
 def growth(code):
-    if code not in age20 or code not in age21 or age20[code] == 0:
-        raise KeyError(code)
-    return (age21[code] - age20[code]) / age20[code] * 100.0
+    old = a20[code]['age20_29']
+    new = a21[code]['age20_29']
+    if old == 0:
+        raise SystemExit(f'zero 2020 age20_29 {code}')
+    return (new / old - 1.0) * 100.0
 
 
-AGE_CHECKS = {
-    '27127': 4.227660796039852,
-    '27128': 2.3763643100897177,
-    '23106': 1.4963272893710792,
-    '23112': -3.084607549507896,
-}
-age_errors = {c: abs(growth(c) - v) for c, v in AGE_CHECKS.items()}
-if max(age_errors.values()) > 1e-10:
-    detail = {c: {'got': growth(c), 'expected': v, 'error': age_errors[c]} for c, v in AGE_CHECKS.items()}
-    raise SystemExit('age parser reference mismatch ' + json.dumps(detail, ensure_ascii=False))
+ref_errors = {c: abs(growth(c) - v) for c,v in temporal_refs.items()}
+if max(ref_errors.values()) > 1e-10:
+    detail = {c: {'got': growth(c), 'expected': v, 'error': ref_errors[c]} for c,v in temporal_refs.items()}
+    raise SystemExit('original temporal transform reproduction failed ' + json.dumps(detail, ensure_ascii=False))
 
-pred = [(code, name, metro, growth(code)) for code, name, metro in REGIONS]
+corrected_spatial = [(c, metro, growth(c)) for c,metro in SPATIAL_CODES]
+fresh_pred = [(c,name,metro,growth(c)) for c,name,metro in FRESH_REGIONS]
 
-DENOM_REFS = {'27102': 4981, '27128': 31316, '23101': 7324, '23106': 20983}
-targets = {r[0] for r in REGIONS} | set(DENOM_REFS)
+DENOM_REFS = {'27102':4981,'27128':31316,'23101':7324,'23106':20983}
+targets = {c for c,_,_ in FRESH_REGIONS} | set(DENOM_REFS)
 wb = xlrd.open_workbook('/tmp/denom/table1.xls', on_demand=True)
 candidates = []
 for sidx in range(wb.nsheets):
@@ -195,7 +120,7 @@ for sidx in range(wb.nsheets):
     for i in range(sh.nrows):
         found = None
         for j in range(min(8, sh.ncols)):
-            c = norm_code(sh.cell_value(i, j))
+            c = code5(sh.cell_value(i,j))
             if c in targets:
                 found = c
                 break
@@ -205,9 +130,9 @@ for sidx in range(wb.nsheets):
         continue
     for col in range(sh.ncols):
         ok = True
-        for code, val in DENOM_REFS.items():
+        for code,val in DENOM_REFS.items():
             try:
-                num = float(str(sh.cell_value(rows[code], col)).replace(',', ''))
+                num = float(str(sh.cell_value(rows[code],col)).replace(',',''))
             except Exception:
                 ok = False
                 break
@@ -215,64 +140,69 @@ for sidx in range(wb.nsheets):
                 ok = False
                 break
         if ok:
-            candidates.append((sidx, col, rows))
+            candidates.append((sidx,col,rows))
 if len(candidates) != 1:
     raise SystemExit('denominator reference column not unique: ' + repr([(a,b) for a,b,_ in candidates]))
-sidx, col, rows = candidates[0]
+sidx,col,rows = candidates[0]
 sh = wb.sheet_by_index(sidx)
-denom = []
-for code, name, metro in REGIONS:
+fresh_denom = []
+for code,name,metro in FRESH_REGIONS:
     if code not in rows:
         raise SystemExit('missing denominator row ' + code)
-    val = int(round(float(str(sh.cell_value(rows[code], col)).replace(',', ''))))
+    val = int(round(float(str(sh.cell_value(rows[code],col)).replace(',',''))))
     if val <= 0:
         raise SystemExit('invalid denominator ' + code)
-    denom.append((code, name, metro, val))
+    fresh_denom.append((code,name,metro,val))
 denominator_sheet = sh.name
 wb.release_resources()
 
-p1 = OUT / 'age_growth_fresh_spatial_holdout_2022_predictor_30regions.csv'
-with p1.open('w', encoding='utf-8', newline='') as f:
+p_corr = OUT/'age_growth_spatial_holdout_2022_corrected_40regions.csv'
+with p_corr.open('w', encoding='utf-8', newline='') as f:
+    w = csv.writer(f, lineterminator='\n')
+    w.writerow(['region_code','metro','age20_29_growth_2020_to_2021_pct_corrected'])
+    w.writerows(corrected_spatial)
+
+p_pred = OUT/'age_growth_fresh_spatial_holdout_2022_predictor_30regions.csv'
+with p_pred.open('w', encoding='utf-8', newline='') as f:
     w = csv.writer(f, lineterminator='\n')
     w.writerow(['region_code','region_name','metro','age20_29_growth_2020_to_2021_pct'])
-    w.writerows(pred)
-p2 = OUT / 'establishments_2016_age_growth_fresh_spatial_holdout_30regions.csv'
-with p2.open('w', encoding='utf-8', newline='') as f:
+    w.writerows(fresh_pred)
+
+p_den = OUT/'establishments_2016_age_growth_fresh_spatial_holdout_30regions.csv'
+with p_den.open('w', encoding='utf-8', newline='') as f:
     w = csv.writer(f, lineterminator='\n')
     w.writerow(['region_code','region_name','metro','private_establishments_2016'])
-    w.writerows(denom)
+    w.writerows(fresh_denom)
 
 
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 meta = {
-    'status': 'FROZEN_BEFORE_OUTCOME_RETRIEVAL',
+    'status': 'CORRECTION_AUDIT_AND_FRESH_SOURCE_FREEZE_BEFORE_OUTCOME',
     'canonical_preregistration_boundary': 'f6b8e89d55f29f5f637fd52a58a08f598c8b7ff2',
+    'original_temporal_source_run': 32596779351,
+    'original_temporal_source_job': 97088922150,
     'transport_repository': 'nekomario28/workers',
-    'source_artifact_ids': {'demand': 9481762001, 'denominator': 9480653606},
-    'regions': {'total': 30, 'Sapporo': 10, 'Kobe': 9, 'Kyoto': 11},
-    'predictor': 'age20_29_growth_2020_to_2021_pct',
+    'source_artifact_ids': {'demand':9481762001,'denominator':9480653606},
     'source_sha256': {
-        '2020_age': '481c335fe5e5458c7751aec403c289e55cfeb3d0e2a81cc789eb043c00a21c0b',
-        '2021_age': 'af485797942888ae6d6b6bc0d1777e791e8715cba5d83c3b117cec0fc6eac394',
-        'denominator_2016': '73249e927cf4363b375b2fbdafc6d5c2466c566998cba4844b3c5b505c6cd35b',
+        '2020_age':'481c335fe5e5458c7751aec403c289e55cfeb3d0e2a81cc789eb043c00a21c0b',
+        '2021_age':'af485797942888ae6d6b6bc0d1777e791e8715cba5d83c3b117cec0fc6eac394',
+        'denominator_2016':'73249e927cf4363b375b2fbdafc6d5c2466c566998cba4844b3c5b505c6cd35b',
     },
+    'transform': 'exact original age_rows semantics: code=row[0][:5], sex=row[3]==計, age20_29=row[9]+row[10], growth=(2021/2020-1)*100',
+    'source_formats': {'2020_age':fmt20,'2021_age':fmt21},
     'validation': {
-        'age_reference_checks': AGE_CHECKS,
-        'age_max_abs_error': max(age_errors.values()),
-        '2020_age_sheet': sheet20,
-        '2020_age_columns_zero_based': cols20,
-        '2021_age_sheet': sheet21,
-        '2021_age_columns_zero_based': cols21,
+        'temporal_reference_checks': temporal_refs,
+        'temporal_reference_max_abs_error': max(ref_errors.values()),
         'denominator_reference_checks': DENOM_REFS,
         'denominator_sheet': denominator_sheet,
         'denominator_column_zero_based': col,
     },
-    'files': {p1.name: sha(p1), p2.name: sha(p2)},
-    'outcome_retrieved': False,
+    'files': {p_corr.name:sha(p_corr),p_pred.name:sha(p_pred),p_den.name:sha(p_den)},
+    'fresh_outcome_retrieved': False,
     'zero_fill': False,
 }
-p3 = OUT / 'age_growth_fresh_spatial_holdout_2022_source_freeze_meta.json'
-p3.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+p_meta = OUT/'age_growth_fresh_spatial_holdout_2022_source_freeze_meta.json'
+p_meta.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
 print(json.dumps(meta, ensure_ascii=False, indent=2))
