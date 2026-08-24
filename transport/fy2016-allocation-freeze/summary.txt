@@ -1,0 +1,6 @@
+index_url=https://www.mlit.go.jp/page/kanbo05_hy_001112.html
+index_sha256=7748ac4f2c621f56c28a71d2c728427c53498813b7c8a455c364c9c73696d0bd
+prefecture_pdf_count=47
+total_pdf_bytes=90192707
+pdftotext_failures=0
+candidate_phrase_hits=0
