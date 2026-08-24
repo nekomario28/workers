@@ -1,0 +1,125 @@
+name: FY2016 allocation freeze transport
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+
+jobs:
+  freeze:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+
+      - name: Install PDF tooling
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y poppler-utils
+
+      - name: Fetch and hash exact national source bytes
+        env:
+          INDEX_URL: https://www.mlit.go.jp/page/kanbo05_hy_001112.html
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/fy2016-allocation" transport/fy2016-allocation-freeze
+          mkdir -p "$RUNNER_TEMP/fy2016-allocation/pdfs" "$RUNNER_TEMP/fy2016-allocation/text" transport/fy2016-allocation-freeze/text
+          python3 - <<'PY'
+          import csv, hashlib, html, os, re, shutil, subprocess, urllib.parse, urllib.request
+          from html.parser import HTMLParser
+          from pathlib import Path
+
+          INDEX_URL=os.environ['INDEX_URL']
+          PREFS=['北海道','青森','岩手','宮城','秋田','山形','福島','茨城','栃木','群馬','埼玉','千葉','東京','神奈川','新潟','富山','石川','福井','山梨','長野','岐阜','静岡','愛知','三重','滋賀','京都','大阪','兵庫','奈良','和歌山','鳥取','島根','岡山','広島','山口','徳島','香川','愛媛','高知','福岡','佐賀','長崎','熊本','大分','宮崎','鹿児島','沖縄']
+          class P(HTMLParser):
+              def __init__(self): super().__init__(); self.href=None; self.buf=[]; self.links=[]
+              def handle_starttag(self,tag,attrs):
+                  if tag.lower()=='a': self.href=dict(attrs).get('href'); self.buf=[]
+              def handle_data(self,data):
+                  if self.href is not None: self.buf.append(data)
+              def handle_endtag(self,tag):
+                  if tag.lower()=='a' and self.href is not None:
+                      self.links.append((re.sub(r'\s+','',html.unescape(''.join(self.buf))),self.href)); self.href=None; self.buf=[]
+          def get(url,timeout=120):
+              req=urllib.request.Request(url,headers={'User-Agent':'NeighborhoodPulseSourceFreeze/1.0 (+GitHub Actions)'})
+              with urllib.request.urlopen(req,timeout=timeout) as r: return r.read()
+
+          root=Path(os.environ['RUNNER_TEMP'])/'fy2016-allocation'; out=Path('transport/fy2016-allocation-freeze')
+          idx=get(INDEX_URL,60); (root/'index.html').write_bytes(idx)
+          p=P(); p.feed(idx.decode('utf-8',errors='replace'))
+          by={}
+          for text,href in p.links:
+              if text in PREFS and href:
+                  u=urllib.parse.urljoin(INDEX_URL,href)
+                  if u.lower().endswith('.pdf'): by[text]=u
+          missing=[x for x in PREFS if x not in by]
+          if len(by)!=47 or missing: raise SystemExit(f'index discovery count={len(by)} missing={missing}')
+
+          rows=[]; windows=[]
+          pats=('都市再生整備計画','都市再生整備','まちづくり交付金')
+          for i,pref in enumerate(PREFS,1):
+              url=by[pref]; data=get(url)
+              if not data.startswith(b'%PDF-'): raise SystemExit(f'not PDF: {pref} {url}')
+              name=url.rsplit('/',1)[-1]; pdf=root/'pdfs'/f'{i:02d}_{pref}_{name}'; pdf.write_bytes(data)
+              txt=root/'text'/f'{i:02d}_{pref}.txt'
+              cp=subprocess.run(['pdftotext','-layout',str(pdf),str(txt)],capture_output=True,text=True)
+              text=txt.read_text(encoding='utf-8',errors='replace') if txt.exists() else ''
+              shutil.copyfile(txt,out/'text'/txt.name)
+              pi=subprocess.run(['pdfinfo',str(pdf)],capture_output=True,text=True)
+              m=re.search(r'^Pages:\s+(\d+)',pi.stdout,re.M); pages=int(m.group(1)) if m else ''
+              lines=text.splitlines(); hits=0
+              for n,line in enumerate(lines):
+                  if any(q in line for q in pats):
+                      hits+=1; lo=max(0,n-30); hi=min(len(lines),n+31)
+                      windows.append(f'===== {i:02d} {pref} line {n+1} =====\n'+'\n'.join(lines[lo:hi]))
+              rows.append({'prefecture_order':i,'prefecture':pref,'source_url':url,'source_filename':name,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),'pages':pages,'pdftotext_exit':cp.returncode,'text_bytes':len(text.encode("utf-8")),'candidate_phrase_hits':hits})
+
+          fields=list(rows[0])
+          with (out/'manifest.csv').open('w',newline='',encoding='utf-8') as f:
+              w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(rows)
+          (out/'candidate_contexts.txt').write_text('\n\n'.join(windows)+'\n',encoding='utf-8')
+          index_sha=hashlib.sha256(idx).hexdigest()
+          (out/'summary.txt').write_text(
+              f'index_url={INDEX_URL}\nindex_sha256={index_sha}\nprefecture_pdf_count=47\ntotal_pdf_bytes={sum(r["bytes"] for r in rows)}\npdftotext_failures={sum(r["pdftotext_exit"]!=0 for r in rows)}\ncandidate_phrase_hits={sum(r["candidate_phrase_hits"] for r in rows)}\n',encoding='utf-8')
+          (root/'SHA256SUMS').write_text('\n'.join(f'{r["sha256"]}  pdfs/{r["prefecture_order"]:02d}_{r["prefecture"]}_{r["source_filename"]}' for r in rows)+'\n',encoding='utf-8')
+          shutil.copyfile(root/'index.html',out/'index.html')
+          shutil.copyfile(root/'SHA256SUMS',out/'SHA256SUMS')
+          print((out/'summary.txt').read_text())
+          PY
+
+      - name: Validate byte acquisition
+        run: |
+          set -euo pipefail
+          test "$(find "$RUNNER_TEMP/fy2016-allocation/pdfs" -type f -name '*.pdf' | wc -l)" -eq 47
+          test "$(tail -n +2 transport/fy2016-allocation-freeze/manifest.csv | wc -l)" -eq 47
+          (cd "$RUNNER_TEMP/fy2016-allocation" && sha256sum --check SHA256SUMS)
+
+      - name: Upload exact source bytes as transport artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: fy2016-mlit-national-allocation-source-bytes-${{ github.event.pull_request.head.sha }}
+          if-no-files-found: error
+          retention-days: 90
+          path: |
+            ${{ runner.temp }}/fy2016-allocation/index.html
+            ${{ runner.temp }}/fy2016-allocation/SHA256SUMS
+            ${{ runner.temp }}/fy2016-allocation/pdfs/
+            ${{ runner.temp }}/fy2016-allocation/text/
+
+      - name: Commit transport receipts and extracted text
+        env:
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add transport/fy2016-allocation-freeze
+          git commit -m 'Record FY2016 allocation source transport receipts [skip ci]'
+          git push origin "HEAD:${HEAD_BRANCH}"
